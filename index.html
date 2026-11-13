@@ -195,6 +195,7 @@
       questions: savedQuestions || JSON.parse(JSON.stringify(DEFAULT_QUESTIONS)),
       pin: '',
       pinLocked: false,
+      roomToken: '', // Format "driver:id" encodé dans le QR code
       status: 'lobby',
       paused: false,
       remainingTime: 20,
@@ -441,42 +442,213 @@
       startHostSession();
     }
 
-    // --- RÉSEAU HTTPS SANS CACHE MOBILE ---
-    const NTFY = 'https://ntfy.sh';
+    // --- RÉSEAU MULTI-SERVEURS COMPATIBLE TOUS PARE-FEUX ---
+    const CloudBus = {
+      async fetchWithTimeout(url, opts = {}, ms = 4500) {
+        const ctrl = new AbortController();
+        const id = setTimeout(() => ctrl.abort(), ms);
+        try {
+          const res = await fetch(url, { ...opts, signal: ctrl.signal, cache: 'no-store' });
+          clearTimeout(id);
+          return res;
+        } catch (e) {
+          clearTimeout(id);
+          throw e;
+        }
+      },
 
-    async function postSignal(channel, obj) {
-      try {
-        const res = await fetch(`${NTFY}/${channel}`, {
-          method: 'POST',
-          body: JSON.stringify(obj)
-        });
-        return res.ok;
-      } catch (e) {
+      // Crée un canal de session sur le premier serveur accessible par le réseau de l'utilisateur
+      async createRoom(initialData) {
+        const bodyStr = JSON.stringify(initialData);
+
+        // 1. Essai avec JSONBlob (HTTPS standard)
+        try {
+          const res = await this.fetchWithTimeout('https://jsonblob.com/api/jsonBlob', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+            body: bodyStr
+          });
+          if (res.ok) {
+            const loc = res.headers.get('Location') || res.headers.get('x-jsonblob');
+            if (loc) {
+              const id = loc.split('/').pop();
+              return `jb_${id}`;
+            }
+          }
+        } catch (e) {}
+
+        // 2. Secours automatique sur KVdb (autorisé par quasi tous les pare-feux d'entreprise)
+        try {
+          const bucketRes = await this.fetchWithTimeout('https://kvdb.io', { method: 'POST' });
+          if (bucketRes.ok) {
+            const bucketId = (await bucketRes.text()).trim();
+            if (bucketId) {
+              await this.fetchWithTimeout(`https://kvdb.io/${bucketId}/room`, {
+                method: 'POST',
+                body: bodyStr
+              });
+              return `kv_${bucketId}`;
+            }
+          }
+        } catch (e) {}
+
+        // 3. Secours ntfy.sh
+        try {
+          const randId = Math.random().toString(36).substring(2, 10);
+          const res = await this.fetchWithTimeout(`https://ntfy.sh/ce26_r_${randId}`, {
+            method: 'POST',
+            body: bodyStr
+          });
+          if (res.ok) return `nt_${randId}`;
+        } catch (e) {}
+
+        return null;
+      },
+
+      async writeHostState(token, data) {
+        const bodyStr = JSON.stringify(data);
+        try {
+          if (token.startsWith('jb_')) {
+            const id = token.slice(3);
+            const res = await this.fetchWithTimeout(`https://jsonblob.com/api/jsonBlob/${id}`, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+              body: bodyStr
+            });
+            return res.ok;
+          }
+          if (token.startsWith('kv_')) {
+            const bucket = token.slice(3);
+            const res = await this.fetchWithTimeout(`https://kvdb.io/${bucket}/room`, {
+              method: 'POST',
+              body: bodyStr
+            });
+            return res.ok;
+          }
+          if (token.startsWith('nt_')) {
+            const ch = token.slice(3);
+            const res = await this.fetchWithTimeout(`https://ntfy.sh/ce26_r_${ch}`, {
+              method: 'POST',
+              body: bodyStr
+            });
+            return res.ok;
+          }
+        } catch (e) {}
         return false;
-      }
-    }
+      },
 
-    async function readSignals(channel) {
-      try {
-        // Paramètre anti-cache (_t) obligatoire pour Safari / Chrome Mobile
-        const res = await fetch(`${NTFY}/${channel}/json?poll=1&since=all&_t=${Date.now()}`, {
-          cache: 'no-store'
-        });
-        if (!res.ok) return [];
-        const txt = await res.text();
-        if (!txt.trim()) return [];
-        return txt.trim().split('\n').map(l => {
-          try { return JSON.parse(l); } catch (e) { return null; }
-        }).filter(ev => ev && ev.event === 'message' && ev.message);
-      } catch (e) {
-        return [];
-      }
-    }
+      async readHostState(token) {
+        try {
+          if (token.startsWith('jb_')) {
+            const id = token.slice(3);
+            const res = await this.fetchWithTimeout(`https://jsonblob.com/api/jsonBlob/${id}?_t=${Date.now()}`, {
+              headers: { 'Accept': 'application/json' }
+            });
+            if (res.ok) return await res.json();
+          }
+          if (token.startsWith('kv_')) {
+            const bucket = token.slice(3);
+            const res = await this.fetchWithTimeout(`https://kvdb.io/${bucket}/room?_t=${Date.now()}`);
+            if (res.ok) return await res.json();
+          }
+          if (token.startsWith('nt_')) {
+            const ch = token.slice(3);
+            const res = await this.fetchWithTimeout(`https://ntfy.sh/ce26_r_${ch}/json?poll=1&since=all&_t=${Date.now()}`);
+            if (res.ok) {
+              const txt = await res.text();
+              let latest = null;
+              txt.trim().split('\n').forEach(l => {
+                try {
+                  const ev = JSON.parse(l);
+                  if (ev && ev.event === 'message' && ev.message) {
+                    const p = JSON.parse(ev.message);
+                    if (!latest || p.seq > latest.seq) latest = p;
+                  }
+                } catch (e) {}
+              });
+              return latest;
+            }
+          }
+        } catch (e) {}
+        return null;
+      },
 
-    async function broadcastHostCommand() {
+      // Chaque joueur écrit dans sa propre clé (aucun écrasement possible)
+      async sendPlayerAction(token, playerId, actionObj) {
+        const bodyStr = JSON.stringify(actionObj);
+        try {
+          if (token.startsWith('kv_')) {
+            const bucket = token.slice(3);
+            const res = await this.fetchWithTimeout(`https://kvdb.io/${bucket}/p_${playerId}`, {
+              method: 'POST',
+              body: bodyStr
+            });
+            return res.ok;
+          }
+          if (token.startsWith('jb_')) {
+            const id = token.slice(3);
+            const cur = await this.readHostState(token);
+            if (!cur) return false;
+            if (!cur.inbox) cur.inbox = {};
+            cur.inbox[playerId] = actionObj;
+            return await this.writeHostState(token, cur);
+          }
+          if (token.startsWith('nt_')) {
+            const ch = token.slice(3);
+            const res = await this.fetchWithTimeout(`https://ntfy.sh/ce26_in_${ch}`, {
+              method: 'POST',
+              body: bodyStr
+            });
+            return res.ok;
+          }
+        } catch (e) {}
+        return false;
+      },
+
+      async readPlayerActions(token, knownPlayerIds) {
+        const actions = [];
+        try {
+          if (token.startsWith('kv_')) {
+            const bucket = token.slice(3);
+            const listRes = await this.fetchWithTimeout(`https://kvdb.io/${bucket}/?values=true&format=json&_t=${Date.now()}`);
+            if (listRes.ok) {
+              const pairs = await listRes.json();
+              if (Array.isArray(pairs)) {
+                pairs.forEach(([k, v]) => {
+                  if (k.startsWith('p_')) {
+                    try { actions.push(JSON.parse(v)); } catch (e) {}
+                  }
+                });
+              }
+            }
+          } else if (token.startsWith('jb_')) {
+            const cur = await this.readHostState(token);
+            if (cur && cur.inbox) {
+              Object.values(cur.inbox).forEach(act => actions.push(act));
+            }
+          } else if (token.startsWith('nt_')) {
+            const ch = token.slice(3);
+            const res = await this.fetchWithTimeout(`https://ntfy.sh/ce26_in_${ch}/json?poll=1&since=all&_t=${Date.now()}`);
+            if (res.ok) {
+              const txt = await res.text();
+              txt.trim().split('\n').forEach(l => {
+                try {
+                  const ev = JSON.parse(l);
+                  if (ev && ev.event === 'message' && ev.message) actions.push(JSON.parse(ev.message));
+                } catch (e) {}
+              });
+            }
+          }
+        } catch (e) {}
+        return actions;
+      }
+    };
+
+    function buildHostPayload() {
       state.seq++;
       const qObj = state.questions[state.currentQuestion];
-      const cmd = {
+      const payload = {
+        pin: state.pin,
         seq: state.seq,
         st: state.status,
         pz: state.paused ? 1 : 0,
@@ -484,7 +656,7 @@
         tot: state.questions.length
       };
       if (qObj && (state.status === 'question' || state.status === 'reveal')) {
-        cmd.qd = {
+        payload.qd = {
           t: qObj.question,
           o: qObj.options,
           c: qObj.correct,
@@ -493,9 +665,15 @@
       }
       if (state.status === 'leaderboard' || state.status === 'podium') {
         const sorted = Object.values(state.players).sort((a, b) => b.score - a.score);
-        cmd.rk = sorted.map(p => [p.id, p.score, p.lastPoints]);
+        payload.rk = sorted.map(p => [p.id, p.score, p.lastPoints]);
       }
-      const ok = await postSignal(`ce26_out_${state.pin}`, cmd);
+      return payload;
+    }
+
+    async function broadcastHostCommand() {
+      if (!state.roomToken) return;
+      const payload = buildHostPayload();
+      const ok = await CloudBus.writeHostState(state.roomToken, payload);
       const statusEl = document.getElementById('net-status');
       if (statusEl) {
         statusEl.textContent = ok ? 'Salle en ligne' : 'Reconnexion...';
@@ -503,10 +681,11 @@
       }
     }
 
-    function startHostSession() {
+    async function startHostSession() {
       cleanupNetwork();
       const pin = Math.floor(100000 + Math.random() * 900000).toString();
       state.pin = pin;
+      state.roomToken = '';
       state.view = 'host';
       state.status = 'lobby';
       state.paused = false;
@@ -516,30 +695,41 @@
       state.seq = 0;
       SoundEngine.mode = 'lobby';
       render();
-      broadcastHostCommand();
 
-      const seenIds = new Set();
+      const initialData = buildHostPayload();
+      const token = await CloudBus.createRoom(initialData);
+
+      const statusEl = document.getElementById('net-status');
+      if (!token) {
+        if (statusEl) {
+          statusEl.textContent = 'Réseau bloqué (activez la 4G sur le PC)';
+          statusEl.className = 'text-xs font-extrabold uppercase tracking-wider text-red-600';
+        }
+        return;
+      }
+
+      state.roomToken = token;
+      // Enregistre le code PIN court sur un annuaire public si les joueurs tapent le PIN à la main
+      CloudBus.fetchWithTimeout(`https://kvdb.io/8kX9vP2mQ7nL4wR1tY6zB3/pin_${pin}`, {
+        method: 'POST',
+        body: token
+      }).catch(() => {});
+
+      render(); // Génère le QR code contenant directement le token universel
 
       state.pollInterval = setInterval(async () => {
-        const events = await readSignals(`ce26_in_${pin}`);
-        events.forEach(ev => {
-          if (seenIds.has(ev.id)) return;
-          seenIds.add(ev.id);
+        const actions = await CloudBus.readPlayerActions(state.roomToken, Object.keys(state.players));
+        actions.forEach(msg => {
+          if (!msg || !msg.id) return;
 
-          let msg = null;
-          try { msg = JSON.parse(ev.message); } catch (e) { return; }
-          if (!msg) return;
+          if (!state.players[msg.id]) {
+            state.players[msg.id] = { id: msg.id, pseudo: msg.n || 'Joueur', score: 0, lastPoints: 0 };
+            if (state.status === 'lobby') updateLobbyPlayersDOM();
+          } else if (msg.n) {
+            state.players[msg.id].pseudo = msg.n;
+          }
 
-          if (msg.t === 'join') {
-            if (!state.players[msg.id]) {
-              state.players[msg.id] = { id: msg.id, pseudo: msg.n || 'Joueur', score: 0, lastPoints: 0 };
-            } else {
-              state.players[msg.id].pseudo = msg.n || state.players[msg.id].pseudo;
-            }
-            if (state.status === 'lobby') {
-              updateLobbyPlayersDOM();
-            }
-          } else if (msg.t === 'ans') {
+          if (typeof msg.a === 'number' && typeof msg.q === 'number') {
             if (state.status !== 'question' || state.paused || state.currentQuestion !== msg.q) return;
             const qKey = 'q_' + msg.q;
             if (!state.answers[qKey]) state.answers[qKey] = {};
@@ -552,22 +742,20 @@
             const points = isCorrect ? Math.round(500 + 500 * Math.max(0, Math.min(1, 1 - (elapsed / maxTime)))) : 0;
 
             state.answers[qKey][msg.id] = { answerIndex: msg.a, isCorrect, points };
-            if (state.players[msg.id]) {
-              state.players[msg.id].score += points;
-              state.players[msg.id].lastPoints = points;
-            }
+            state.players[msg.id].score += points;
+            state.players[msg.id].lastPoints = points;
 
             const totalPlayers = Object.keys(state.players).length;
             const totalAnswers = Object.keys(state.answers[qKey]).length;
             const ansEl = document.getElementById('host-answer-count');
-            if (ansEl) ansEl.textContent = `${totalAnswers} / ${totalPlayers} réponses`;
+            if (ansEl) ansEl.textContent = `${totalAnswers} / ${totalPlayers} rép.`;
 
             if (totalPlayers > 0 && totalAnswers >= totalPlayers) {
               hostRevealAnswer();
             }
           }
         });
-      }, 900);
+      }, 1000);
     }
 
     function updateLobbyPlayersDOM() {
@@ -635,24 +823,31 @@
       if (state.status === 'lobby') {
         const players = Object.values(state.players);
         const baseUrl = window.location.href.split('?')[0].split('#')[0];
-        const joinUrl = `${baseUrl}?pin=${state.pin}`;
+        const joinUrl = state.roomToken
+          ? `${baseUrl}?pin=${state.pin}&r=${encodeURIComponent(state.roomToken)}`
+          : `${baseUrl}?pin=${state.pin}`;
+
         app.innerHTML = `
           <div class="card-cream p-8 md:p-10">
             <div class="flex justify-between items-center mb-6">
               <button onclick="goHome()" class="text-xs font-bold text-[#168049] hover:underline cursor-pointer">← Retour à l'accueil</button>
-              <span id="net-status" class="text-xs font-extrabold uppercase tracking-wider text-amber-600">Connexion...</span>
+              <span id="net-status" class="text-xs font-extrabold uppercase tracking-wider ${state.roomToken ? 'text-[#168049]' : 'text-amber-600'}">
+                ${state.roomToken ? 'Salle en ligne' : 'Connexion au réseau...'}
+              </span>
             </div>
 
             <div class="grid grid-cols-1 md:grid-cols-12 gap-8 items-center bg-white p-6 md:p-8 rounded-2xl border border-[#0E5A36]/15 shadow-sm mb-8">
               <div class="md:col-span-4 flex flex-col items-center justify-center border-b md:border-b-0 md:border-r border-stone-200 pb-6 md:pb-0 md:pr-6">
-                <div id="qrcode-box" class="p-3 bg-white rounded-xl border-2 border-[#0E5A36]/20 shadow-sm mb-3"></div>
+                <div id="qrcode-box" class="p-3 bg-white rounded-xl border-2 border-[#0E5A36]/20 shadow-sm mb-3 min-w-[185px] min-h-[185px] flex items-center justify-center">
+                  ${state.roomToken ? '' : '<span class="text-xs text-stone-400 font-bold">Création de la salle...</span>'}
+                </div>
                 <span class="text-xs font-bold text-[#0E5A36] text-center">Scannez pour entrer directement</span>
               </div>
               <div class="md:col-span-8 text-center md:text-left">
                 <p class="text-xs font-bold uppercase tracking-wider text-[#168049] mb-1">Code de la session</p>
                 <div class="text-5xl md:text-7xl font-black text-[#0E5A36] tracking-widest my-2 select-all">${state.pin}</div>
                 <p class="text-xs text-stone-500 break-all mb-6">${escapeHtml(joinUrl)}</p>
-                <button onclick="hostNextQuestion(0)" class="btn-primary px-8 py-4 rounded-xl font-extrabold text-lg shadow-lg cursor-pointer">
+                <button onclick="hostNextQuestion(0)" ${state.roomToken ? '' : 'disabled'} class="btn-primary px-8 py-4 rounded-xl font-extrabold text-lg shadow-lg cursor-pointer disabled:opacity-50">
                   Démarrer le quiz (${state.questions.length} questions)
                 </button>
               </div>
@@ -671,20 +866,22 @@
             </div>
           </div>
         `;
-        setTimeout(() => {
-          const qrBox = document.getElementById('qrcode-box');
-          if (qrBox) {
-            qrBox.innerHTML = '';
-            new QRCode(qrBox, {
-              text: joinUrl,
-              width: 185,
-              height: 185,
-              colorDark: "#0E5A36",
-              colorLight: "#FFFFFF",
-              correctLevel: QRCode.CorrectLevel.M
-            });
-          }
-        }, 30);
+        if (state.roomToken) {
+          setTimeout(() => {
+            const qrBox = document.getElementById('qrcode-box');
+            if (qrBox) {
+              qrBox.innerHTML = '';
+              new QRCode(qrBox, {
+                text: joinUrl,
+                width: 185,
+                height: 185,
+                colorDark: "#0E5A36",
+                colorLight: "#FFFFFF",
+                correctLevel: QRCode.CorrectLevel.M
+              });
+            }
+          }, 30);
+        }
         return;
       }
 
@@ -707,6 +904,7 @@
                 </span>
               </div>
               <div class="flex items-center gap-3">
+                <span id="net-status" class="text-[10px] font-bold uppercase text-[#168049]">Salle en ligne</span>
                 <button onclick="togglePause()" class="px-4 py-2 rounded-xl ${state.paused ? 'bg-amber-500 text-white' : 'bg-white text-[#0E5A36] border border-[#0E5A36]/20'} font-extrabold text-xs uppercase tracking-wider cursor-pointer shadow-sm">
                   ${state.paused ? '▶ Reprendre' : '❚❚ Pause'}
                 </button>
@@ -875,18 +1073,22 @@
     }
 
     // --- JOUEUR (TÉLÉPHONE) ---
-    function openJoinView(prefillPin = '', locked = false) {
+    function openJoinView(prefillPin = '', locked = false, roomToken = '') {
       cleanupNetwork();
       state.view = 'join';
       if (prefillPin) {
         state.pin = prefillPin;
         state.pinLocked = locked;
       }
+      if (roomToken) {
+        state.roomToken = roomToken;
+      }
       render();
     }
 
     function unlockPinField() {
       state.pinLocked = false;
+      state.roomToken = '';
       render();
     }
 
@@ -925,6 +1127,15 @@
       `;
     }
 
+    let playerSyncFn = null;
+
+    async function manualPlayerRefresh() {
+      const btn = document.getElementById('manual-sync-btn');
+      if (btn) btn.textContent = 'Actualisation...';
+      if (playerSyncFn) await playerSyncFn();
+      if (btn) btn.textContent = 'Actualiser l\'écran';
+    }
+
     async function handleJoinSubmit(e) {
       e.preventDefault();
       const pin = document.getElementById('join-pin').value.trim();
@@ -935,8 +1146,24 @@
       btn.disabled = true;
       btn.textContent = "Connexion...";
 
+      let token = state.roomToken;
+      if (!token) {
+        try {
+          const res = await CloudBus.fetchWithTimeout(`https://kvdb.io/8kX9vP2mQ7nL4wR1tY6zB3/pin_${pin}?_t=${Date.now()}`);
+          if (res.ok) token = (await res.text()).trim();
+        } catch (err) {}
+      }
+
+      if (!token) {
+        alert("Session introuvable. Scannez directement le QR code affiché à l'écran.");
+        btn.disabled = false;
+        btn.textContent = "Entrer dans la partie";
+        return;
+      }
+
       cleanupNetwork();
       state.pin = pin;
+      state.roomToken = token;
       state.pseudo = pseudo;
       state.status = 'lobby';
       state.paused = false;
@@ -950,8 +1177,7 @@
       state.seq = 0;
       SafeStorage.set('quiz_ce_2026_pseudo', pseudo);
 
-      await postSignal(`ce26_in_${pin}`, {
-        t: 'join',
+      await CloudBus.sendPlayerAction(token, state.playerId, {
         id: state.playerId,
         n: pseudo
       });
@@ -959,24 +1185,9 @@
       state.view = 'player';
       render();
 
-      const syncPlayer = async () => {
-        const events = await readSignals(`ce26_out_${pin}`);
-        if (events.length === 0) return;
-
-        // Parcourt les événements pour trouver celui avec le numéro de séquence le plus élevé
-        let latestCmd = null;
-        events.forEach(ev => {
-          try {
-            const parsed = JSON.parse(ev.message);
-            if (parsed && typeof parsed.seq === 'number') {
-              if (!latestCmd || parsed.seq > latestCmd.seq) {
-                latestCmd = parsed;
-              }
-            }
-          } catch (err) {}
-        });
-
-        if (!latestCmd) return;
+      playerSyncFn = async () => {
+        const latestCmd = await CloudBus.readHostState(token);
+        if (!latestCmd || typeof latestCmd.seq !== 'number') return;
 
         if (latestCmd.seq > state.seq) {
           const prevQ = state.currentQuestion;
@@ -996,7 +1207,6 @@
             };
           }
 
-          // Réinitialise la réponse dès qu'on passe à une nouvelle question ou qu'on relance une question
           if (latestCmd.st === 'question' && (prevQ !== latestCmd.q || prevStatus !== 'question')) {
             if (!state.paused) {
               state.selectedAnswer = null;
@@ -1029,8 +1239,8 @@
         }
       };
 
-      await syncPlayer();
-      state.pollInterval = setInterval(syncPlayer, 900);
+      await playerSyncFn();
+      state.pollInterval = setInterval(playerSyncFn, 1000);
     }
 
     async function handlePlayerAnswer(answerIdx) {
@@ -1038,9 +1248,9 @@
       state.selectedAnswer = answerIdx;
       render();
 
-      await postSignal(`ce26_in_${state.pin}`, {
-        t: 'ans',
+      await CloudBus.sendPlayerAction(state.roomToken, state.playerId, {
         id: state.playerId,
+        n: state.pseudo,
         q: state.currentQuestion,
         a: answerIdx
       });
@@ -1050,10 +1260,13 @@
       if (state.status === 'lobby') {
         app.innerHTML = `
           <div class="card-cream p-8 max-w-md mx-auto text-center">
-            <span class="inline-block px-3 py-1 rounded-full bg-[#0E5A36]/10 text-[#0E5A36] font-bold text-xs mb-4">Connecté</span>
+            <span class="inline-block px-3 py-1 rounded-full bg-[#0E5A36]/10 text-[#0E5A36] font-bold text-xs mb-4">Connecté (Session ${escapeHtml(state.pin)})</span>
             <h2 class="text-2xl font-black text-[#0E5A36] mb-2">Bienvenue, ${escapeHtml(state.pseudo)}</h2>
             <p class="text-sm text-stone-600 font-medium mb-6">Votre nom apparaît à l'écran. La partie va bientôt commencer.</p>
-            <div class="w-10 h-10 border-4 border-[#168049] border-t-transparent rounded-full animate-spin mx-auto"></div>
+            <div class="w-10 h-10 border-4 border-[#168049] border-t-transparent rounded-full animate-spin mx-auto mb-6"></div>
+            <button id="manual-sync-btn" onclick="manualPlayerRefresh()" class="px-4 py-2 rounded-lg bg-white border border-[#0E5A36]/20 text-xs font-bold text-[#0E5A36] cursor-pointer">
+              Actualiser l'écran
+            </button>
           </div>
         `;
         return;
@@ -1064,7 +1277,10 @@
           <div class="card-cream p-8 max-w-md mx-auto text-center">
             <span class="inline-block px-3 py-1 rounded-full bg-amber-100 text-amber-800 font-bold text-xs uppercase tracking-wider mb-4">Pause</span>
             <h2 class="text-2xl font-black text-[#0E5A36] mb-2">Quiz en pause</h2>
-            <p class="text-sm text-stone-600 font-medium">L'animateur a suspendu la partie quelques instants.</p>
+            <p class="text-sm text-stone-600 font-medium mb-4">L'animateur a suspendu la partie quelques instants.</p>
+            <button id="manual-sync-btn" onclick="manualPlayerRefresh()" class="px-4 py-2 rounded-lg bg-white border border-[#0E5A36]/20 text-xs font-bold text-[#0E5A36] cursor-pointer">
+              Actualiser l'écran
+            </button>
           </div>
         `;
         return;
@@ -1078,7 +1294,10 @@
             <div class="card-cream p-8 max-w-md mx-auto text-center">
               <span class="text-xs font-bold uppercase tracking-wider text-[#168049] block mb-2">Question ${state.currentQuestion + 1} / ${state.totalQuestions}</span>
               <h2 class="text-2xl font-black text-[#0E5A36] mb-3">Réponse enregistrée</h2>
-              <p class="text-sm text-stone-600 font-medium">Regardez l'écran principal pour le résultat.</p>
+              <p class="text-sm text-stone-600 font-medium mb-4">Regardez l'écran principal pour le résultat.</p>
+              <button id="manual-sync-btn" onclick="manualPlayerRefresh()" class="px-4 py-2 rounded-lg bg-white border border-[#0E5A36]/20 text-xs font-bold text-[#0E5A36] cursor-pointer">
+                Actualiser l'écran
+              </button>
             </div>
           `;
           return;
@@ -1113,10 +1332,13 @@
             </div>
             <h2 class="text-3xl font-black text-[#0E5A36] mb-2">${isCorrect ? `+${state.myLastPoints} points` : '0 point'}</h2>
             <p class="text-sm font-bold text-stone-600 mb-4">Total : ${state.myScore} points</p>
-            <div class="bg-white p-4 rounded-xl border border-[#0E5A36]/15 text-xs text-left">
+            <div class="bg-white p-4 rounded-xl border border-[#0E5A36]/15 text-xs text-left mb-4">
               <span class="font-bold text-[#0E5A36] block mb-1">Réponse attendue :</span>
               <span class="font-semibold text-[#1A2E22]">${escapeHtml(q.options[q.correct])}</span>
             </div>
+            <button id="manual-sync-btn" onclick="manualPlayerRefresh()" class="px-4 py-2 rounded-lg bg-white border border-[#0E5A36]/20 text-xs font-bold text-[#0E5A36] cursor-pointer">
+              Actualiser l'écran
+            </button>
           </div>
         `;
         return;
@@ -1131,7 +1353,9 @@
             <div class="text-5xl font-black text-[#0E5A36] my-3">${state.myRank > 0 ? state.myRank + (state.myRank === 1 ? 'er' : 'e') : '-'}</div>
             <p class="text-lg font-extrabold text-[#1A2E22] mb-1">${escapeHtml(state.pseudo)}</p>
             <p class="text-sm font-bold text-[#168049] mb-6">${state.myScore} points</p>
-            ${state.status === 'podium' ? `<button onclick="goHome()" class="btn-primary px-6 py-3 rounded-xl font-bold text-sm">Retour à l'accueil</button>` : ''}
+            ${state.status === 'podium'
+              ? `<button onclick="goHome()" class="btn-primary px-6 py-3 rounded-xl font-bold text-sm">Retour à l'accueil</button>`
+              : `<button id="manual-sync-btn" onclick="manualPlayerRefresh()" class="px-4 py-2 rounded-lg bg-white border border-[#0E5A36]/20 text-xs font-bold text-[#0E5A36] cursor-pointer">Actualiser l'écran</button>`}
           </div>
         `;
       }
@@ -1150,8 +1374,9 @@
     (function init() {
       const urlParams = new URLSearchParams(window.location.search);
       const pinFromUrl = urlParams.get('pin') || '';
+      const tokenFromUrl = urlParams.get('r') || '';
       if (pinFromUrl) {
-        openJoinView(pinFromUrl, true);
+        openJoinView(pinFromUrl, true, tokenFromUrl);
       } else {
         render();
       }
