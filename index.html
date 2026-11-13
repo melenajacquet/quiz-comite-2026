@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Quiz Comité Echange 2026</title>
   <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
   <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@500;600;700;800;900&display=swap" rel="stylesheet">
   <style>
@@ -60,17 +61,6 @@
   </div>
 
   <script>
-    const SafeStorage = {
-      mem: {},
-      get(k) {
-        try { return window.localStorage.getItem(k); } catch (e) { return this.mem[k] || null; }
-      },
-      set(k, v) {
-        this.mem[k] = v;
-        try { window.localStorage.setItem(k, v); } catch (e) {}
-      }
-    };
-
     const DEFAULT_QUESTIONS = [
       {
         question: "Quelle opération commerciale a généré un record de +20M€ de CA en Proximité en 2025 ?",
@@ -86,12 +76,7 @@
       {
         question: "Quel est le quota valeur des Marques De Distributeurs (MDD) en France en 2026 ?",
         timer: 20,
-        options: [
-          "32,1 %",
-          "34,7 %",
-          "38,5 %",
-          "29,4 %"
-        ],
+        options: ["32,1 %", "34,7 %", "38,5 %", "29,4 %"],
         correct: 1
       },
       {
@@ -100,7 +85,7 @@
         options: [
           "1. La marque / 2. La qualité / 3. Le prix / 4. Le goût",
           "1. Le goût / 2. Le prix / 3. La qualité / 4. La marque",
-          "1. Le goût / 2. La qualité / 3. La marque / 4. Le prix",
+          "1. Le goût / 2. Le qualité / 3. La marque / 4. Le prix",
           "1. Le prix / 2. La marque / 3. Le goût / 4. La qualité"
         ],
         correct: 1
@@ -108,67 +93,37 @@
       {
         question: "Combien dépense en moyenne par visite un GROS client MDC chez Carrefour (contre 23 € pour un petit client) ?",
         timer: 20,
-        options: [
-          "29 € par visite",
-          "32 € par visite",
-          "36 € par visite",
-          "42 € par visite"
-        ],
+        options: ["29 € par visite", "32 € par visite", "36 € par visite", "42 € par visite"],
         correct: 2
       },
       {
         question: "Quelle part du chiffre d'affaires total des innovations du groupe Carrefour est réalisée par la Proximité ?",
         timer: 20,
-        options: [
-          "1/5 du CA",
-          "1/4 du CA",
-          "1/3 du CA",
-          "La moitié du CA"
-        ],
+        options: ["1/5 du CA", "1/4 du CA", "1/3 du CA", "La moitié du CA"],
         correct: 2
       },
       {
         question: "Sous quel nouveau nom la gamme beauté MDC « Science » est-elle relookée ?",
         timer: 20,
-        options: [
-          "Nectar of Bio",
-          "Nectar of Glow",
-          "Pure Science",
-          "Carrefour Expert Glow"
-        ],
+        options: ["Nectar of Bio", "Nectar of Glow", "Pure Science", "Carrefour Expert Glow"],
         correct: 1
       },
       {
         question: "Avec la bascule en Collection Mensuelle via GAME dès septembre, combien de références sont proposées en engagement en plus des 20 en Flux Poussé ?",
         timer: 20,
-        options: [
-          "Jusqu'à 10 références",
-          "Jusqu'à 20 références",
-          "Jusqu'à 30 références",
-          "Jusqu'à 50 références"
-        ],
+        options: ["Jusqu'à 10 références", "Jusqu'à 20 références", "Jusqu'à 30 références", "Jusqu'à 50 références"],
         correct: 2
       },
       {
         question: "Quelle quantité d'UVC a été engagée sur Red Bull Winter en 2025 (contre 313 680 UVC sécurisées en 2026) ?",
         timer: 20,
-        options: [
-          "416 219 UVC",
-          "29 524 UVC",
-          "120 613 UVC",
-          "65 680 UVC"
-        ],
+        options: ["416 219 UVC", "29 524 UVC", "120 613 UVC", "65 680 UVC"],
         correct: 0
       },
       {
         question: "Quelle progression de CA la nutrition sportive a-t-elle enregistrée au S1 2026 vs S1 2025 ?",
         timer: 20,
-        options: [
-          "+35 %",
-          "+50 %",
-          "+75 %",
-          "+95 %"
-        ],
+        options: ["+35 %", "+50 %", "+75 %", "+95 %"],
         correct: 2
       },
       {
@@ -186,7 +141,7 @@
 
     let savedQuestions = null;
     try {
-      const rawQ = SafeStorage.get('quiz_ce_2026_questions');
+      const rawQ = localStorage.getItem('quiz_ce_2026_questions');
       if (rawQ) savedQuestions = JSON.parse(rawQ);
     } catch (e) {}
 
@@ -194,7 +149,6 @@
       view: 'home',
       questions: savedQuestions || JSON.parse(JSON.stringify(DEFAULT_QUESTIONS)),
       pin: '',
-      binId: '',
       pinLocked: false,
       status: 'lobby',
       paused: false,
@@ -205,18 +159,17 @@
       questionStartTime: 0,
       players: {},
       answers: {},
-      playerId: SafeStorage.get('quiz_ce_2026_pid') || ('p_' + Math.random().toString(36).substring(2, 9)),
-      pseudo: SafeStorage.get('quiz_ce_2026_pseudo') || '',
+      playerId: 'p_' + Math.random().toString(36).substring(2, 9),
+      pseudo: '',
       selectedAnswer: null,
       myScore: 0,
       myLastPoints: 0,
       myRank: 0,
       timerInterval: null,
-      pollInterval: null,
-      seq: 0
+      peer: null,
+      connections: {},
+      hostConn: null
     };
-
-    SafeStorage.set('quiz_ce_2026_pid', state.playerId);
 
     // --- Moteur Audio ---
     const SoundEngine = {
@@ -293,9 +246,13 @@
 
     function cleanupNetwork() {
       if (state.timerInterval) clearInterval(state.timerInterval);
-      if (state.pollInterval) clearInterval(state.pollInterval);
       state.timerInterval = null;
-      state.pollInterval = null;
+      if (state.peer) {
+        try { state.peer.destroy(); } catch (e) {}
+        state.peer = null;
+      }
+      state.connections = {};
+      state.hostConn = null;
     }
 
     function goHome() {
@@ -316,6 +273,7 @@
       else if (state.view === 'player') renderPlayer(app);
     }
 
+    // --- ACCUEIL ---
     function renderHome(app) {
       app.innerHTML = `
         <div class="card-cream p-8 md:p-14 text-center max-w-3xl mx-auto">
@@ -356,6 +314,12 @@
     function openEditor() {
       state.view = 'editor';
       render();
+    }
+
+    function saveQuestions() {
+      try {
+        localStorage.setItem('quiz_ce_2026_questions', JSON.stringify(state.questions));
+      } catch (e) {}
     }
 
     function renderEditor(app) {
@@ -405,12 +369,12 @@
 
     function updateQuestionField(idx, field, val) {
       state.questions[idx][field] = val;
-      SafeStorage.set('quiz_ce_2026_questions', JSON.stringify(state.questions));
+      saveQuestions();
     }
 
     function updateOptionField(qIdx, oIdx, val) {
       state.questions[qIdx].options[oIdx] = val;
-      SafeStorage.set('quiz_ce_2026_questions', JSON.stringify(state.questions));
+      saveQuestions();
     }
 
     function addQuestion() {
@@ -420,57 +384,33 @@
         options: ["Réponse A", "Réponse B", "Réponse C", "Réponse D"],
         correct: 0
       });
-      SafeStorage.set('quiz_ce_2026_questions', JSON.stringify(state.questions));
+      saveQuestions();
       render();
     }
 
     function deleteQuestion(idx) {
       if (state.questions.length <= 1) return alert("Le quiz doit contenir au moins une question.");
       state.questions.splice(idx, 1);
-      SafeStorage.set('quiz_ce_2026_questions', JSON.stringify(state.questions));
+      saveQuestions();
       render();
     }
 
     function resetDefaultQuestions() {
       state.questions = JSON.parse(JSON.stringify(DEFAULT_QUESTIONS));
-      SafeStorage.set('quiz_ce_2026_questions', JSON.stringify(state.questions));
+      saveQuestions();
       render();
     }
 
     function saveAndStartHost() {
-      SafeStorage.set('quiz_ce_2026_questions', JSON.stringify(state.questions));
+      saveQuestions();
       startHostSession();
     }
 
-    // --- BACKEND SIMPLE SANS CONFIGURATION (BASE FIREBASE REST HTTPS) ---
-    // Chaque session a son propre dossier unique : /ce26_sessions/{pin}
-    // L'animateur écrit uniquement dans /ce26_sessions/{pin}/host
-    // Chaque joueur écrit uniquement dans /ce26_sessions/{pin}/players/{playerId} et /answers/{q}/{playerId}
-    const DB_ROOT = "https://quiz-comite-default-rtdb.europe-west1.firebasedatabase.app";
-
-    async function dbPut(path, data) {
-      const res = await fetch(`${DB_ROOT}/${path}.json`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(data)
-      });
-      if (!res.ok) throw new Error("HTTP " + res.status);
-      return true;
-    }
-
-    async function dbGet(path) {
-      const res = await fetch(`${DB_ROOT}/${path}.json?_t=${Date.now()}`, {
-        cache: "no-store"
-      });
-      if (!res.ok) throw new Error("HTTP " + res.status);
-      return await res.json();
-    }
-
+    // --- LOGIQUE ANIMATEUR ---
     function buildHostPayload() {
-      state.seq++;
       const qObj = state.questions[state.currentQuestion];
       const payload = {
-        seq: state.seq,
+        type: 'state',
         st: state.status,
         pz: state.paused ? 1 : 0,
         q: state.currentQuestion,
@@ -491,27 +431,18 @@
       return payload;
     }
 
-    async function broadcastHostCommand() {
-      if (!state.pin) return;
-      try {
-        await dbPut(`ce26_sessions/${state.pin}/host`, buildHostPayload());
-        const statusEl = document.getElementById('net-status');
-        if (statusEl) {
-          statusEl.textContent = 'Salle en ligne';
-          statusEl.className = 'text-xs font-extrabold uppercase tracking-wider text-[#168049]';
+    function broadcastHostCommand() {
+      const payload = buildHostPayload();
+      Object.values(state.connections).forEach(conn => {
+        if (conn && conn.open) {
+          try { conn.send(payload); } catch (e) {}
         }
-      } catch (e) {
-        const statusEl = document.getElementById('net-status');
-        if (statusEl) {
-          statusEl.textContent = 'Reconnexion...';
-          statusEl.className = 'text-xs font-extrabold uppercase tracking-wider text-amber-600';
-        }
-      }
+      });
     }
 
-    async function startHostSession() {
+    function startHostSession() {
       cleanupNetwork();
-      const pin = Math.floor(100000 + Math.random() * 900000).toString();
+      const pin = Math.floor(1000 + Math.random() * 9000).toString();
       state.pin = pin;
       state.view = 'host';
       state.status = 'lobby';
@@ -519,75 +450,66 @@
       state.currentQuestion = 0;
       state.players = {};
       state.answers = {};
-      state.seq = 0;
       SoundEngine.mode = 'lobby';
       render();
 
-      try {
-        await dbPut(`ce26_sessions/${pin}`, {
-          host: buildHostPayload(),
-          players: {},
-          answers: {}
-        });
+      const peer = new Peer(`quiz-ce2026-${pin}`, { secure: true });
+      state.peer = peer;
+
+      peer.on('open', () => {
         const statusEl = document.getElementById('net-status');
         if (statusEl) {
-          statusEl.textContent = 'Salle en ligne';
+          statusEl.textContent = 'Salle prête';
           statusEl.className = 'text-xs font-extrabold uppercase tracking-wider text-[#168049]';
         }
-      } catch (e) {
+      });
+
+      peer.on('error', (err) => {
         const statusEl = document.getElementById('net-status');
         if (statusEl) {
-          statusEl.textContent = 'Erreur réseau (' + e.message + ')';
+          statusEl.textContent = 'Erreur : ' + err.type;
           statusEl.className = 'text-xs font-extrabold uppercase tracking-wider text-red-600';
         }
-        return;
-      }
+      });
 
-      state.pollInterval = setInterval(async () => {
-        try {
-          const sessionData = await dbGet(`ce26_sessions/${pin}`);
-          if (!sessionData) return;
+      peer.on('connection', (conn) => {
+        conn.on('open', () => {
+          state.connections[conn.peer] = conn;
+          conn.send(buildHostPayload());
+        });
 
-          if (sessionData.players) {
-            let lobbyChanged = false;
-            Object.entries(sessionData.players).forEach(([pid, pInfo]) => {
-              if (!pInfo || !pInfo.pseudo) return;
-              if (!state.players[pid]) {
-                state.players[pid] = { id: pid, pseudo: pInfo.pseudo, score: 0, lastPoints: 0 };
-                lobbyChanged = true;
-              } else if (state.players[pid].pseudo !== pInfo.pseudo) {
-                state.players[pid].pseudo = pInfo.pseudo;
-                lobbyChanged = true;
-              }
-            });
-            if (lobbyChanged && state.status === 'lobby') {
+        conn.on('data', (msg) => {
+          if (!msg || typeof msg !== 'object') return;
+          if (msg.type === 'join') {
+            state.connections[msg.id] = conn;
+            state.players[msg.id] = {
+              id: msg.id,
+              pseudo: msg.pseudo || 'Joueur',
+              score: state.players[msg.id] ? state.players[msg.id].score : 0,
+              lastPoints: 0
+            };
+            if (state.status === 'lobby') {
               updateLobbyPlayersDOM();
             }
-          }
-
-          if (state.status === 'question' && !state.paused && sessionData.answers) {
-            const qKey = 'q_' + state.currentQuestion;
-            const remoteAns = sessionData.answers[qKey] || {};
+            conn.send(buildHostPayload());
+          } else if (msg.type === 'ans') {
+            if (state.status !== 'question' || state.paused || state.currentQuestion !== msg.q) return;
+            const qKey = 'q_' + msg.q;
             if (!state.answers[qKey]) state.answers[qKey] = {};
+            if (state.answers[qKey][msg.id]) return;
 
-            const qObj = state.questions[state.currentQuestion];
+            const qObj = state.questions[msg.q];
+            const elapsed = Math.max(0, (Date.now() - state.questionStartTime) / 1000);
             const maxTime = qObj.timer || 20;
+            const isCorrect = (msg.a === qObj.correct);
+            const points = isCorrect ? Math.round(500 + 500 * Math.max(0, Math.min(1, 1 - (elapsed / maxTime)))) : 0;
 
-            Object.entries(remoteAns).forEach(([pid, ansObj]) => {
-              if (!ansObj || typeof ansObj.a !== 'number') return;
-              if (state.answers[qKey][pid]) return;
-
-              const elapsed = Math.max(0, (Date.now() - state.questionStartTime) / 1000);
-              const isCorrect = (ansObj.a === qObj.correct);
-              const points = isCorrect ? Math.round(500 + 500 * Math.max(0, Math.min(1, 1 - (elapsed / maxTime)))) : 0;
-
-              state.answers[qKey][pid] = { answerIndex: ansObj.a, isCorrect, points };
-              if (!state.players[pid]) {
-                state.players[pid] = { id: pid, pseudo: ansObj.n || 'Joueur', score: 0, lastPoints: 0 };
-              }
-              state.players[pid].score += points;
-              state.players[pid].lastPoints = points;
-            });
+            state.answers[qKey][msg.id] = { answerIndex: msg.a, isCorrect, points };
+            if (!state.players[msg.id]) {
+              state.players[msg.id] = { id: msg.id, pseudo: msg.pseudo || 'Joueur', score: 0, lastPoints: 0 };
+            }
+            state.players[msg.id].score += points;
+            state.players[msg.id].lastPoints = points;
 
             const totalPlayers = Object.keys(state.players).length;
             const totalAnswers = Object.keys(state.answers[qKey]).length;
@@ -598,8 +520,8 @@
               hostRevealAnswer();
             }
           }
-        } catch (e) {}
-      }, 1000);
+        });
+      });
     }
 
     function updateLobbyPlayersDOM() {
@@ -673,7 +595,7 @@
           <div class="card-cream p-8 md:p-10">
             <div class="flex justify-between items-center mb-6">
               <button onclick="goHome()" class="text-xs font-bold text-[#168049] hover:underline cursor-pointer">← Retour à l'accueil</button>
-              <span id="net-status" class="text-xs font-extrabold uppercase tracking-wider text-amber-600">Création de la salle...</span>
+              <span id="net-status" class="text-xs font-extrabold uppercase tracking-wider text-amber-600">Ouverture de la salle...</span>
             </div>
 
             <div class="grid grid-cols-1 md:grid-cols-12 gap-8 items-center bg-white p-6 md:p-8 rounded-2xl border border-[#0E5A36]/15 shadow-sm mb-8">
@@ -682,7 +604,7 @@
                 <span class="text-xs font-bold text-[#0E5A36] text-center">Scannez pour entrer directement</span>
               </div>
               <div class="md:col-span-8 text-center md:text-left">
-                <p class="text-xs font-bold uppercase tracking-wider text-[#168049] mb-1">Code de la session</p>
+                <p class="text-xs font-bold uppercase tracking-wider text-[#168049] mb-1">Code PIN de la session</p>
                 <div class="text-5xl md:text-7xl font-black text-[#0E5A36] tracking-widest my-2 select-all">${state.pin}</div>
                 <p class="text-xs text-stone-500 break-all mb-6">${escapeHtml(joinUrl)}</p>
                 <button onclick="hostNextQuestion(0)" class="btn-primary px-8 py-4 rounded-xl font-extrabold text-lg shadow-lg cursor-pointer">
@@ -740,7 +662,6 @@
                 </span>
               </div>
               <div class="flex items-center gap-3">
-                <span id="net-status" class="text-[10px] font-bold uppercase text-[#168049]">Salle en ligne</span>
                 <button onclick="togglePause()" class="px-4 py-2 rounded-xl ${state.paused ? 'bg-amber-500 text-white' : 'bg-white text-[#0E5A36] border border-[#0E5A36]/20'} font-extrabold text-xs uppercase tracking-wider cursor-pointer shadow-sm">
                   ${state.paused ? '▶ Reprendre' : '❚❚ Pause'}
                 </button>
@@ -908,7 +829,7 @@
       link.click();
     }
 
-    // --- JOUEUR (TÉLÉPHONE) ---
+    // --- LOGIQUE PARTICIPANT ---
     function openJoinView(prefillPin = '', locked = false) {
       cleanupNetwork();
       state.view = 'join';
@@ -931,7 +852,7 @@
           <span class="text-xs font-bold uppercase tracking-wider text-[#168049] block mb-1">Quiz Comité Echange 2026</span>
           <h2 class="text-2xl font-black text-[#0E5A36] mb-1">Rejoindre la partie</h2>
           <p class="text-xs text-stone-600 font-medium mb-6">
-            ${state.pinLocked ? 'Indiquez simplement votre prénom ou magasin pour entrer.' : 'Entrez le code affiché à l\'écran et votre prénom ou magasin.'}
+            ${state.pinLocked ? 'Indiquez simplement votre prénom ou magasin pour entrer.' : 'Entrez le code PIN affiché à l\'écran et votre prénom ou magasin.'}
           </p>
 
           <form onsubmit="handleJoinSubmit(event)" class="space-y-4">
@@ -944,7 +865,7 @@
             ` : `
               <div>
                 <label class="block text-xs font-bold uppercase tracking-wider text-[#0E5A36] mb-1">Code PIN</label>
-                <input type="text" id="join-pin" inputmode="numeric" maxlength="6" required value="${escapeHtml(state.pin)}" placeholder="000000" class="w-full bg-white border-2 border-[#0E5A36]/20 rounded-xl px-4 py-3 text-center text-2xl font-black tracking-widest text-[#0E5A36] focus:outline-none focus:border-[#168049]">
+                <input type="text" id="join-pin" inputmode="numeric" maxlength="4" required value="${escapeHtml(state.pin)}" placeholder="0000" class="w-full bg-white border-2 border-[#0E5A36]/20 rounded-xl px-4 py-3 text-center text-2xl font-black tracking-widest text-[#0E5A36] focus:outline-none focus:border-[#168049]">
               </div>
             `}
             <div>
@@ -959,7 +880,7 @@
       `;
     }
 
-    async function handleJoinSubmit(e) {
+    function handleJoinSubmit(e) {
       e.preventDefault();
       const pin = document.getElementById('join-pin').value.trim();
       const pseudo = document.getElementById('join-pseudo').value.trim();
@@ -969,122 +890,130 @@
       btn.disabled = true;
       btn.textContent = "Connexion...";
 
-      try {
-        const hostState = await dbGet(`ce26_sessions/${pin}/host`);
-        if (!hostState) {
-          alert("Code PIN introuvable (" + pin + "). Vérifiez le code affiché sur l'écran principal.");
+      cleanupNetwork();
+      state.pin = pin;
+      state.pseudo = pseudo;
+      state.status = 'lobby';
+      state.paused = false;
+      state.currentQuestion = 0;
+      state.totalQuestions = state.questions.length;
+      state.activeQuestionObj = null;
+      state.selectedAnswer = null;
+      state.myScore = 0;
+      state.myLastPoints = 0;
+      state.myRank = 0;
+
+      const peer = new Peer({ secure: true });
+      state.peer = peer;
+
+      const failTimeout = setTimeout(() => {
+        if (state.view === 'join') {
+          alert("Impossible de joindre la salle " + pin + ". Vérifiez le code PIN affiché sur l'écran principal.");
           btn.disabled = false;
           btn.textContent = "Entrer dans la partie";
-          return;
         }
+      }, 8000);
 
-        cleanupNetwork();
-        state.pin = pin;
-        state.pseudo = pseudo;
-        state.status = 'lobby';
-        state.paused = false;
-        state.currentQuestion = 0;
-        state.totalQuestions = state.questions.length;
-        state.activeQuestionObj = null;
-        state.selectedAnswer = null;
-        state.myScore = 0;
-        state.myLastPoints = 0;
-        state.myRank = 0;
-        state.seq = 0;
-        SafeStorage.set('quiz_ce_2026_pseudo', pseudo);
+      peer.on('open', () => {
+        const conn = peer.connect(`quiz-ce2026-${pin}`, { reliable: true });
+        state.hostConn = conn;
 
-        await dbPut(`ce26_sessions/${pin}/players/${state.playerId}`, {
-          pseudo: pseudo,
-          joinedAt: Date.now()
+        conn.on('open', () => {
+          clearTimeout(failTimeout);
+          conn.send({
+            type: 'join',
+            id: state.playerId,
+            pseudo: pseudo
+          });
+          state.view = 'player';
+          render();
         });
 
-        state.view = 'player';
-        render();
+        conn.on('data', (msg) => {
+          if (!msg || msg.type !== 'state') return;
+          const prevQ = state.currentQuestion;
+          const prevStatus = state.status;
 
-        const syncState = async () => {
-          try {
-            const latestCmd = await dbGet(`ce26_sessions/${pin}/host`);
-            if (!latestCmd || typeof latestCmd.seq !== 'number') return;
+          state.status = msg.st;
+          state.paused = msg.pz === 1;
+          state.currentQuestion = msg.q;
+          if (msg.tot) state.totalQuestions = msg.tot;
 
-            if (latestCmd.seq > state.seq) {
-              const prevQ = state.currentQuestion;
-              const prevStatus = state.status;
-              state.seq = latestCmd.seq;
-              state.status = latestCmd.st;
-              state.paused = latestCmd.pz === 1;
-              state.currentQuestion = latestCmd.q;
-              if (latestCmd.tot) state.totalQuestions = latestCmd.tot;
+          if (msg.qd) {
+            state.activeQuestionObj = {
+              question: msg.qd.t,
+              options: msg.qd.o,
+              correct: msg.qd.c,
+              timer: msg.qd.tm || 20
+            };
+          }
 
-              if (latestCmd.qd) {
-                state.activeQuestionObj = {
-                  question: latestCmd.qd.t,
-                  options: latestCmd.qd.o,
-                  correct: latestCmd.qd.c,
-                  timer: latestCmd.qd.tm || 20
-                };
-              }
-
-              if (latestCmd.st === 'question' && (prevQ !== latestCmd.q || prevStatus !== 'question')) {
-                if (!state.paused) {
-                  state.selectedAnswer = null;
-                  state.questionStartTime = Date.now();
-                }
-              }
-
-              if (latestCmd.st === 'reveal' && prevStatus !== 'reveal') {
-                const qObj = state.activeQuestionObj || state.questions[latestCmd.q];
-                if (qObj && state.selectedAnswer === qObj.correct) {
-                  const elapsed = Math.max(0, (Date.now() - state.questionStartTime) / 1000);
-                  const maxTime = qObj.timer || 20;
-                  const pts = Math.round(500 + 500 * Math.max(0, Math.min(1, 1 - (elapsed / maxTime))));
-                  state.myLastPoints = pts;
-                  state.myScore += pts;
-                } else {
-                  state.myLastPoints = 0;
-                }
-              }
-
-              if (Array.isArray(latestCmd.rk)) {
-                const idx = latestCmd.rk.findIndex(item => item[0] === state.playerId);
-                if (idx !== -1) {
-                  state.myRank = idx + 1;
-                  state.myScore = latestCmd.rk[idx][1];
-                }
-              }
-
-              render();
+          if (msg.st === 'question' && (prevQ !== msg.q || prevStatus !== 'question')) {
+            if (!state.paused) {
+              state.selectedAnswer = null;
+              state.questionStartTime = Date.now();
             }
-          } catch (err) {}
-        };
+          }
 
-        await syncState();
-        state.pollInterval = setInterval(syncState, 900);
-      } catch (err) {
+          if (msg.st === 'reveal' && prevStatus !== 'reveal') {
+            const qObj = state.activeQuestionObj || state.questions[msg.q];
+            if (qObj && state.selectedAnswer === qObj.correct) {
+              const elapsed = Math.max(0, (Date.now() - state.questionStartTime) / 1000);
+              const maxTime = qObj.timer || 20;
+              const pts = Math.round(500 + 500 * Math.max(0, Math.min(1, 1 - (elapsed / maxTime))));
+              state.myLastPoints = pts;
+              state.myScore += pts;
+            } else {
+              state.myLastPoints = 0;
+            }
+          }
+
+          if (Array.isArray(msg.rk)) {
+            const idx = msg.rk.findIndex(item => item[0] === state.playerId);
+            if (idx !== -1) {
+              state.myRank = idx + 1;
+              state.myScore = msg.rk[idx][1];
+            }
+          }
+
+          render();
+        });
+
+        conn.on('close', () => {
+          alert("La connexion avec l'animateur a été interrompue.");
+          goHome();
+        });
+      });
+
+      peer.on('error', () => {
+        clearTimeout(failTimeout);
         alert("Erreur de connexion réseau.");
         btn.disabled = false;
         btn.textContent = "Entrer dans la partie";
-      }
+      });
     }
 
-    async function handlePlayerAnswer(answerIdx) {
+    function handlePlayerAnswer(answerIdx) {
       if (state.selectedAnswer !== null || state.paused) return;
       state.selectedAnswer = answerIdx;
       render();
 
-      try {
-        await dbPut(`ce26_sessions/${state.pin}/answers/q_${state.currentQuestion}/${state.playerId}`, {
-          a: answerIdx,
-          n: state.pseudo,
-          ts: Date.now()
+      if (state.hostConn && state.hostConn.open) {
+        state.hostConn.send({
+          type: 'ans',
+          id: state.playerId,
+          pseudo: state.pseudo,
+          q: state.currentQuestion,
+          a: answerIdx
         });
-      } catch (e) {}
+      }
     }
 
     function renderPlayer(app) {
       if (state.status === 'lobby') {
         app.innerHTML = `
           <div class="card-cream p-8 max-w-md mx-auto text-center">
-            <span class="inline-block px-3 py-1 rounded-full bg-[#0E5A36]/10 text-[#0E5A36] font-bold text-xs mb-4">Connecté (Session ${escapeHtml(state.pin)})</span>
+            <span class="inline-block px-3 py-1 rounded-full bg-[#0E5A36]/10 text-[#0E5A36] font-bold text-xs mb-4">Connecté (PIN ${escapeHtml(state.pin)})</span>
             <h2 class="text-2xl font-black text-[#0E5A36] mb-2">Bienvenue, ${escapeHtml(state.pseudo)}</h2>
             <p class="text-sm text-stone-600 font-medium mb-6">Votre nom apparaît à l'écran. La partie va bientôt commencer.</p>
             <div class="w-10 h-10 border-4 border-[#168049] border-t-transparent rounded-full animate-spin mx-auto"></div>
