@@ -71,7 +71,7 @@
       }
     };
 
-    const QUESTIONS = [
+    const DEFAULT_QUESTIONS = [
       {
         question: "Quelle opération commerciale a généré un record de +20M€ de CA en Proximité en 2025 ?",
         timer: 20,
@@ -184,12 +184,21 @@
       }
     ];
 
+    let savedQuestions = null;
+    try {
+      const rawQ = SafeStorage.get('quiz_ce_2026_questions');
+      if (rawQ) savedQuestions = JSON.parse(rawQ);
+    } catch (e) {}
+
     let state = {
       view: 'home',
+      questions: savedQuestions || JSON.parse(JSON.stringify(DEFAULT_QUESTIONS)),
       pin: '',
       pinLocked: false,
       status: 'lobby',
       currentQuestion: 0,
+      totalQuestions: 10,
+      activeQuestionObj: null,
       questionStartTime: 0,
       players: {},
       answers: {},
@@ -293,6 +302,7 @@
     function render() {
       const app = document.getElementById('app');
       if (state.view === 'home') renderHome(app);
+      else if (state.view === 'editor') renderEditor(app);
       else if (state.view === 'host') renderHost(app);
       else if (state.view === 'join') renderJoin(app);
       else if (state.view === 'player') renderPlayer(app);
@@ -311,7 +321,7 @@
             Animez le quiz en direct sur grand écran et faites participer vos équipes depuis leurs téléphones avec classement instantané.
           </p>
 
-          <div class="grid grid-cols-1 md:grid-cols-2 gap-4 text-left max-w-xl mx-auto">
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-4 text-left">
             <button onclick="startHostSession()" class="btn-primary p-6 rounded-2xl shadow-md flex flex-col justify-between cursor-pointer">
               <span class="text-xs uppercase tracking-wider opacity-80 font-bold mb-2">Animateur</span>
               <span class="text-xl font-extrabold mb-1">Lancer une session</span>
@@ -323,12 +333,108 @@
               <span class="text-xl font-extrabold mb-1">Rejoindre la partie</span>
               <span class="text-xs opacity-90">Entrer le code PIN sur téléphone</span>
             </button>
+
+            <button onclick="openEditor()" class="bg-white hover:bg-stone-100 text-[#0E5A36] border-2 border-[#0E5A36]/20 p-6 rounded-2xl shadow-sm flex flex-col justify-between transition cursor-pointer">
+              <span class="text-xs uppercase tracking-wider text-[#168049] font-bold mb-2">Préparation</span>
+              <span class="text-xl font-extrabold mb-1">Modifier le quiz</span>
+              <span class="text-xs text-[#1A2E22]/70">${state.questions.length} questions prêtes</span>
+            </button>
           </div>
         </div>
       `;
     }
 
-    // --- RÉSEAU HTTPS ULTRA-LÉGER (< 150 OCTETS PAR MESSAGE) ---
+    // --- ÉDITEUR DE QUESTIONS ---
+    function openEditor() {
+      state.view = 'editor';
+      render();
+    }
+
+    function renderEditor(app) {
+      let questionsHtml = state.questions.map((q, idx) => `
+        <div class="bg-white p-6 rounded-xl border border-[#0E5A36]/15 shadow-sm mb-4">
+          <div class="flex flex-wrap items-center justify-between gap-2 mb-4">
+            <span class="font-extrabold text-[#0E5A36] text-sm uppercase tracking-wider">Question ${idx + 1}</span>
+            <div class="flex items-center gap-3">
+              <label class="text-xs font-bold text-stone-600 flex items-center gap-1">
+                Durée (sec) :
+                <input type="number" min="5" max="120" value="${q.timer || 20}" onchange="updateQuestionField(${idx}, 'timer', parseInt(this.value))" class="w-16 border border-stone-300 rounded px-2 py-1 text-center font-bold text-[#0E5A36]">
+              </label>
+              <button onclick="deleteQuestion(${idx})" class="text-xs font-bold text-red-600 hover:underline px-2 py-1">Supprimer</button>
+            </div>
+          </div>
+          <input type="text" value="${escapeHtml(q.question)}" onchange="updateQuestionField(${idx}, 'question', this.value)" class="w-full border border-stone-300 rounded-lg px-3 py-2.5 font-bold text-[#1A2E22] mb-4 focus:outline-none focus:border-[#168049]" placeholder="Intitulé de la question">
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+            ${q.options.map((opt, oIdx) => `
+              <div class="flex items-center gap-2 bg-[#F4F3EE] p-2.5 rounded-lg border ${q.correct === oIdx ? 'border-[#168049] ring-2 ring-[#168049]/30' : 'border-transparent'}">
+                <input type="radio" name="correct_${idx}" ${q.correct === oIdx ? 'checked' : ''} onchange="updateQuestionField(${idx}, 'correct', ${oIdx})" class="accent-[#168049] w-4 h-4 cursor-pointer" title="Cocher la bonne réponse">
+                <input type="text" value="${escapeHtml(opt)}" onchange="updateOptionField(${idx}, ${oIdx}, this.value)" class="w-full bg-transparent text-sm font-semibold focus:outline-none" placeholder="Proposition ${oIdx + 1}">
+              </div>
+            `).join('')}
+          </div>
+        </div>
+      `).join('');
+
+      app.innerHTML = `
+        <div class="card-cream p-6 md:p-10">
+          <div class="flex flex-wrap items-center justify-between gap-4 mb-6 pb-4 border-b border-[#0E5A36]/15">
+            <div>
+              <button onclick="goHome()" class="text-xs font-bold text-[#168049] hover:underline mb-1 block">← Retour à l'accueil</button>
+              <h2 class="text-2xl font-black text-[#0E5A36]">Éditeur de questions</h2>
+            </div>
+            <div class="flex flex-wrap gap-2">
+              <button onclick="resetDefaultQuestions()" class="px-4 py-2 rounded-lg text-xs font-bold bg-stone-200 hover:bg-stone-300 text-stone-800">Réinitialiser</button>
+              <button onclick="addQuestion()" class="px-4 py-2 rounded-lg text-xs font-bold bg-[#0E5A36] hover:bg-[#093E25] text-white">+ Ajouter une question</button>
+              <button onclick="saveAndStartHost()" class="px-5 py-2 rounded-lg text-xs font-bold btn-primary shadow">Enregistrer et lancer</button>
+            </div>
+          </div>
+          <div class="max-h-[65vh] overflow-y-auto pr-1">
+            ${questionsHtml}
+          </div>
+        </div>
+      `;
+    }
+
+    function updateQuestionField(idx, field, val) {
+      state.questions[idx][field] = val;
+      SafeStorage.set('quiz_ce_2026_questions', JSON.stringify(state.questions));
+    }
+
+    function updateOptionField(qIdx, oIdx, val) {
+      state.questions[qIdx].options[oIdx] = val;
+      SafeStorage.set('quiz_ce_2026_questions', JSON.stringify(state.questions));
+    }
+
+    function addQuestion() {
+      state.questions.push({
+        question: "Nouvelle question",
+        timer: 20,
+        options: ["Réponse A", "Réponse B", "Réponse C", "Réponse D"],
+        correct: 0
+      });
+      SafeStorage.set('quiz_ce_2026_questions', JSON.stringify(state.questions));
+      render();
+    }
+
+    function deleteQuestion(idx) {
+      if (state.questions.length <= 1) return alert("Le quiz doit contenir au moins une question.");
+      state.questions.splice(idx, 1);
+      SafeStorage.set('quiz_ce_2026_questions', JSON.stringify(state.questions));
+      render();
+    }
+
+    function resetDefaultQuestions() {
+      state.questions = JSON.parse(JSON.stringify(DEFAULT_QUESTIONS));
+      SafeStorage.set('quiz_ce_2026_questions', JSON.stringify(state.questions));
+      render();
+    }
+
+    function saveAndStartHost() {
+      SafeStorage.set('quiz_ce_2026_questions', JSON.stringify(state.questions));
+      startHostSession();
+    }
+
+    // --- RÉSEAU HTTPS ULTRA-LÉGER (ENVOIE UNIQUEMENT LA QUESTION ACTIVE < 400 OCTETS) ---
     const NTFY = 'https://ntfy.sh';
 
     async function postSignal(channel, obj) {
@@ -343,7 +449,7 @@
       }
     }
 
-    async function readSignals(channel, since = '10m') {
+    async function readSignals(channel, since = '15m') {
       try {
         const res = await fetch(`${NTFY}/${channel}/json?poll=1&since=${since}`, { cache: 'no-store' });
         if (!res.ok) return [];
@@ -359,11 +465,22 @@
 
     async function broadcastHostCommand() {
       state.seq++;
+      const qObj = state.questions[state.currentQuestion];
       const cmd = {
         seq: state.seq,
         st: state.status,
-        q: state.currentQuestion
+        q: state.currentQuestion,
+        tot: state.questions.length
       };
+      // On joint uniquement la question active (texte + 4 options + bonne réponse) -> ~300 octets max
+      if (qObj && (state.status === 'question' || state.status === 'reveal')) {
+        cmd.qd = {
+          t: qObj.question,
+          o: qObj.options,
+          c: qObj.correct,
+          tm: qObj.timer || 20
+        };
+      }
       if (state.status === 'leaderboard' || state.status === 'podium') {
         const sorted = Object.values(state.players).sort((a, b) => b.score - a.score);
         cmd.rk = sorted.map(p => [p.id, p.score, p.lastPoints]);
@@ -417,7 +534,7 @@
             if (!state.answers[qKey]) state.answers[qKey] = {};
             if (state.answers[qKey][msg.id]) return;
 
-            const qObj = QUESTIONS[msg.q];
+            const qObj = state.questions[msg.q];
             const elapsed = Math.max(0, (Date.now() - state.questionStartTime) / 1000);
             const maxTime = qObj.timer || 20;
             const isCorrect = (msg.a === qObj.correct);
@@ -472,7 +589,7 @@
     }
 
     function hostShowLeaderboard() {
-      const isLast = state.currentQuestion >= QUESTIONS.length - 1;
+      const isLast = state.currentQuestion >= state.questions.length - 1;
       state.status = isLast ? 'podium' : 'leaderboard';
       if (isLast) SoundEngine.jingleReveal();
       broadcastHostCommand();
@@ -501,7 +618,7 @@
                 <div class="text-5xl md:text-7xl font-black text-[#0E5A36] tracking-widest my-2 select-all">${state.pin}</div>
                 <p class="text-xs text-stone-500 break-all mb-6">${escapeHtml(joinUrl)}</p>
                 <button onclick="hostNextQuestion(0)" class="btn-primary px-8 py-4 rounded-xl font-extrabold text-lg shadow-lg cursor-pointer">
-                  Démarrer le quiz (${QUESTIONS.length} questions)
+                  Démarrer le quiz (${state.questions.length} questions)
                 </button>
               </div>
             </div>
@@ -536,7 +653,7 @@
         return;
       }
 
-      const q = QUESTIONS[state.currentQuestion];
+      const q = state.questions[state.currentQuestion];
       const qKey = 'q_' + state.currentQuestion;
       const answersObj = state.answers[qKey] || {};
       const totalPlayers = Object.keys(state.players).length;
@@ -548,7 +665,7 @@
           <div class="card-cream p-6 md:p-10">
             <div class="flex items-center justify-between mb-6">
               <span class="px-4 py-1.5 rounded-full bg-[#0E5A36] text-white font-bold text-xs uppercase tracking-wider">
-                Question ${state.currentQuestion + 1} / ${QUESTIONS.length}
+                Question ${state.currentQuestion + 1} / ${state.questions.length}
               </span>
               <div class="flex items-center gap-4">
                 <span id="host-answer-count" class="font-bold text-sm text-[#0E5A36]">${totalAnswers} / ${totalPlayers} réponses</span>
@@ -611,10 +728,10 @@
           <div class="card-cream p-6 md:p-10">
             <div class="flex items-center justify-between mb-6">
               <span class="px-4 py-1.5 rounded-full bg-[#0E5A36] text-white font-bold text-xs uppercase tracking-wider">
-                Résultat — Question ${state.currentQuestion + 1} / ${QUESTIONS.length}
+                Résultat — Question ${state.currentQuestion + 1} / ${state.questions.length}
               </span>
               <button onclick="hostShowLeaderboard()" class="btn-primary px-6 py-3 rounded-xl font-extrabold text-sm shadow cursor-pointer">
-                ${state.currentQuestion >= QUESTIONS.length - 1 ? 'Voir le podium final' : 'Classement intermédiaire'}
+                ${state.currentQuestion >= state.questions.length - 1 ? 'Voir le podium final' : 'Classement intermédiaire'}
               </button>
             </div>
 
@@ -767,6 +884,8 @@
       state.pseudo = pseudo;
       state.status = 'lobby';
       state.currentQuestion = 0;
+      state.totalQuestions = state.questions.length;
+      state.activeQuestionObj = null;
       state.selectedAnswer = null;
       state.myScore = 0;
       state.myLastPoints = 0;
@@ -797,6 +916,16 @@
           state.seq = cmd.seq;
           state.status = cmd.st;
           state.currentQuestion = cmd.q;
+          if (cmd.tot) state.totalQuestions = cmd.tot;
+
+          if (cmd.qd) {
+            state.activeQuestionObj = {
+              question: cmd.qd.t,
+              options: cmd.qd.o,
+              correct: cmd.qd.c,
+              timer: cmd.qd.tm || 20
+            };
+          }
 
           if (cmd.st === 'question' && prevQ !== cmd.q) {
             state.selectedAnswer = null;
@@ -804,8 +933,8 @@
           }
 
           if (cmd.st === 'reveal') {
-            const qObj = QUESTIONS[cmd.q];
-            if (state.selectedAnswer === qObj.correct) {
+            const qObj = state.activeQuestionObj || state.questions[cmd.q];
+            if (qObj && state.selectedAnswer === qObj.correct) {
               const elapsed = Math.max(0, (Date.now() - state.questionStartTime) / 1000);
               const maxTime = qObj.timer || 20;
               const pts = Math.round(500 + 500 * Math.max(0, Math.min(1, 1 - (elapsed / maxTime))));
@@ -855,13 +984,13 @@
         return;
       }
 
-      const q = QUESTIONS[state.currentQuestion];
+      const q = state.activeQuestionObj || state.questions[state.currentQuestion];
 
       if (state.status === 'question') {
         if (state.selectedAnswer !== null) {
           app.innerHTML = `
             <div class="card-cream p-8 max-w-md mx-auto text-center">
-              <span class="text-xs font-bold uppercase tracking-wider text-[#168049] block mb-2">Question ${state.currentQuestion + 1} / ${QUESTIONS.length}</span>
+              <span class="text-xs font-bold uppercase tracking-wider text-[#168049] block mb-2">Question ${state.currentQuestion + 1} / ${state.totalQuestions}</span>
               <h2 class="text-2xl font-black text-[#0E5A36] mb-3">Réponse enregistrée</h2>
               <p class="text-sm text-stone-600 font-medium">Regardez l'écran principal pour le résultat.</p>
             </div>
@@ -872,7 +1001,7 @@
         app.innerHTML = `
           <div class="card-cream p-5 max-w-md mx-auto">
             <div class="flex items-center justify-between mb-4">
-              <span class="text-xs font-extrabold text-[#0E5A36]">Question ${state.currentQuestion + 1} / ${QUESTIONS.length}</span>
+              <span class="text-xs font-extrabold text-[#0E5A36]">Question ${state.currentQuestion + 1} / ${state.totalQuestions}</span>
               <span class="text-xs font-bold text-stone-500">${state.myScore} pts</span>
             </div>
             <p class="font-bold text-sm text-[#1A2E22] mb-4">${escapeHtml(q.question)}</p>
