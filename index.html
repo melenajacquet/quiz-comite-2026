@@ -6,7 +6,6 @@
   <title>Quiz Comité Echange 2026</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
-  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
   <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@500;600;700;800;900&display=swap" rel="stylesheet">
   <style>
     body {
@@ -212,9 +211,9 @@
       myLastPoints: 0,
       myRank: 0,
       timerInterval: null,
+      pollInterval: null,
       seq: 0,
-      mqttClient: null,
-      netConnected: false
+      roomTopic: ''
     };
 
     SafeStorage.set('quiz_ce_2026_pid', state.playerId);
@@ -294,12 +293,9 @@
 
     function cleanupNetwork() {
       if (state.timerInterval) clearInterval(state.timerInterval);
+      if (state.pollInterval) clearInterval(state.pollInterval);
       state.timerInterval = null;
-      if (state.mqttClient) {
-        try { state.mqttClient.end(true); } catch (e) {}
-        state.mqttClient = null;
-      }
-      state.netConnected = false;
+      state.pollInterval = null;
     }
 
     function goHome() {
@@ -446,52 +442,38 @@
       startHostSession();
     }
 
-    // --- CONNEXION TEMPS RÉEL SANS BASE DE DONNÉES (MQTT WSS PORT 443) ---
-    const BROKERS = [
-      'wss://broker.emqx.io:8084/mqtt',
-      'wss://broker.hivemq.com:8884/mqtt',
-      'wss://test.mosquitto.org:8081/mqtt'
-    ];
-
-    function connectBroker(brokerIndex, onConnected, onMessage, onAllFailed) {
-      if (brokerIndex >= BROKERS.length) {
-        if (onAllFailed) onAllFailed();
-        return;
-      }
-
-      const url = BROKERS[brokerIndex];
-      const client = mqtt.connect(url, {
-        clientId: 'ce26_' + Math.random().toString(36).substring(2, 10),
-        connectTimeout: 3500,
-        reconnectPeriod: 1500,
-        clean: true
+    // --- TRANSPORT 100 % HTTPS STANDARD (COMPATIBLE PROXY / VPN PC) ---
+    // Utilise deux canaux HTTPS séparés (cmd = animateur->joueurs, ans = joueurs->animateur)
+    // avec lecture JSON poll=1 (aucun WebSocket, aucun SSE persistant)
+    async function httpPost(channel, obj) {
+      const res = await fetch(`https://ntfy.sh/${channel}`, {
+        method: 'POST',
+        body: JSON.stringify(obj)
       });
+      return res.ok;
+    }
 
-      let connectedOnce = false;
-      const fallbackTimer = setTimeout(() => {
-        if (!connectedOnce) {
-          try { client.end(true); } catch (e) {}
-          connectBroker(brokerIndex + 1, onConnected, onMessage, onAllFailed);
-        }
-      }, 3600);
-
-      client.on('connect', () => {
-        connectedOnce = true;
-        clearTimeout(fallbackTimer);
-        state.mqttClient = client;
-        state.netConnected = true;
-        onConnected(client);
+    async function httpReadAll(channel) {
+      const res = await fetch(`https://ntfy.sh/${channel}/json?poll=1&since=all&_t=${Date.now()}`, {
+        cache: 'no-store'
       });
-
-      client.on('message', (topic, messageBuffer) => {
+      if (!res.ok) return null;
+      const text = await res.text();
+      const msgs = [];
+      text.trim().split('\n').forEach(line => {
+        if (!line) return;
         try {
-          const data = JSON.parse(messageBuffer.toString());
-          onMessage(topic, data);
+          const ev = JSON.parse(line);
+          if (ev && ev.event === 'message' && ev.message) {
+            msgs.push(JSON.parse(ev.message));
+          }
         } catch (e) {}
       });
+      return msgs;
     }
 
     function buildHostPayload() {
+      state.seq++;
       const qObj = state.questions[state.currentQuestion];
       const payload = {
         seq: state.seq,
@@ -515,14 +497,20 @@
       return payload;
     }
 
-    function broadcastHostCommand(incrementSeq = true) {
-      if (incrementSeq) state.seq++;
-      if (!state.mqttClient || !state.netConnected) return;
+    async function broadcastHostCommand() {
+      if (!state.pin) return;
       const payload = buildHostPayload();
-      state.mqttClient.publish(`carrefour/ce2026/${state.pin}/state`, JSON.stringify(payload), { qos: 1, retain: true });
+      try {
+        const ok = await httpPost(`ce2026_cmd_${state.pin}`, payload);
+        const statusEl = document.getElementById('net-status');
+        if (statusEl) {
+          statusEl.textContent = ok ? 'Salle en ligne' : 'Reconnexion...';
+          statusEl.className = `text-xs font-extrabold uppercase tracking-wider ${ok ? 'text-[#168049]' : 'text-amber-600'}`;
+        }
+      } catch (e) {}
     }
 
-    function startHostSession() {
+    async function startHostSession() {
       cleanupNetwork();
       const pin = Math.floor(100000 + Math.random() * 900000).toString();
       state.pin = pin;
@@ -532,53 +520,70 @@
       state.currentQuestion = 0;
       state.players = {};
       state.answers = {};
-      state.seq = 1;
+      state.seq = 0;
       SoundEngine.mode = 'lobby';
       render();
 
-      connectBroker(
-        0,
-        (client) => {
-          client.subscribe(`carrefour/ce2026/${pin}/in`);
-          broadcastHostCommand(false);
-          const statusEl = document.getElementById('net-status');
-          if (statusEl) {
-            statusEl.textContent = 'Salle en ligne';
-            statusEl.className = 'text-xs font-extrabold uppercase tracking-wider text-[#168049]';
+      try {
+        const ok = await httpPost(`ce2026_cmd_${pin}`, buildHostPayload());
+        const statusEl = document.getElementById('net-status');
+        if (statusEl) {
+          statusEl.textContent = ok ? 'Salle en ligne' : 'Erreur serveur';
+          statusEl.className = `text-xs font-extrabold uppercase tracking-wider ${ok ? 'text-[#168049]' : 'text-red-600'}`;
+        }
+      } catch (e) {
+        const statusEl = document.getElementById('net-status');
+        if (statusEl) {
+          statusEl.textContent = 'Connexion bloquée';
+          statusEl.className = 'text-xs font-extrabold uppercase tracking-wider text-red-600';
+        }
+      }
+
+      state.pollInterval = setInterval(async () => {
+        try {
+          const msgs = await httpReadAll(`ce2026_in_${pin}`);
+          if (!msgs) return;
+
+          let lobbyChanged = false;
+          msgs.forEach(msg => {
+            if (!msg || !msg.id) return;
+            if (msg.t === 'join') {
+              if (!state.players[msg.id]) {
+                state.players[msg.id] = { id: msg.id, pseudo: msg.n || 'Joueur', score: 0, lastPoints: 0 };
+                lobbyChanged = true;
+              } else if (state.players[msg.id].pseudo !== msg.n && msg.n) {
+                state.players[msg.id].pseudo = msg.n;
+                lobbyChanged = true;
+              }
+            } else if (msg.t === 'ans') {
+              if (state.status !== 'question' || state.paused || state.currentQuestion !== msg.q) return;
+              const qKey = 'q_' + msg.q;
+              if (!state.answers[qKey]) state.answers[qKey] = {};
+              if (state.answers[qKey][msg.id]) return;
+
+              const qObj = state.questions[msg.q];
+              const elapsed = Math.max(0, (Date.now() - state.questionStartTime) / 1000);
+              const maxTime = qObj.timer || 20;
+              const isCorrect = (msg.a === qObj.correct);
+              const points = isCorrect ? Math.round(500 + 500 * Math.max(0, Math.min(1, 1 - (elapsed / maxTime)))) : 0;
+
+              state.answers[qKey][msg.id] = { answerIndex: msg.a, isCorrect, points };
+              if (!state.players[msg.id]) {
+                state.players[msg.id] = { id: msg.id, pseudo: msg.n || 'Joueur', score: 0, lastPoints: 0 };
+              }
+              state.players[msg.id].score += points;
+              state.players[msg.id].lastPoints = points;
+            }
+          });
+
+          if (lobbyChanged && state.status === 'lobby') {
+            updateLobbyPlayersDOM();
           }
-        },
-        (topic, msg) => {
-          if (!msg || !msg.id) return;
 
-          if (msg.t === 'join') {
-            if (!state.players[msg.id]) {
-              state.players[msg.id] = { id: msg.id, pseudo: msg.n || 'Joueur', score: 0, lastPoints: 0 };
-            } else {
-              state.players[msg.id].pseudo = msg.n || state.players[msg.id].pseudo;
-            }
-            if (state.status === 'lobby') updateLobbyPlayersDOM();
-            broadcastHostCommand(false);
-          } else if (msg.t === 'ans') {
-            if (state.status !== 'question' || state.paused || state.currentQuestion !== msg.q) return;
-            const qKey = 'q_' + msg.q;
-            if (!state.answers[qKey]) state.answers[qKey] = {};
-            if (state.answers[qKey][msg.id]) return;
-
-            const qObj = state.questions[msg.q];
-            const elapsed = Math.max(0, (Date.now() - state.questionStartTime) / 1000);
-            const maxTime = qObj.timer || 20;
-            const isCorrect = (msg.a === qObj.correct);
-            const points = isCorrect ? Math.round(500 + 500 * Math.max(0, Math.min(1, 1 - (elapsed / maxTime)))) : 0;
-
-            state.answers[qKey][msg.id] = { answerIndex: msg.a, isCorrect, points };
-            if (!state.players[msg.id]) {
-              state.players[msg.id] = { id: msg.id, pseudo: msg.n || 'Joueur', score: 0, lastPoints: 0 };
-            }
-            state.players[msg.id].score += points;
-            state.players[msg.id].lastPoints = points;
-
+          if (state.status === 'question') {
+            const qKey = 'q_' + state.currentQuestion;
             const totalPlayers = Object.keys(state.players).length;
-            const totalAnswers = Object.keys(state.answers[qKey]).length;
+            const totalAnswers = Object.keys(state.answers[qKey] || {}).length;
             const ansEl = document.getElementById('host-answer-count');
             if (ansEl) ansEl.textContent = `${totalAnswers} / ${totalPlayers} rép.`;
 
@@ -586,15 +591,8 @@
               hostRevealAnswer();
             }
           }
-        },
-        () => {
-          const statusEl = document.getElementById('net-status');
-          if (statusEl) {
-            statusEl.textContent = 'Réseau bloqué par VPN (lancez sur téléphone en 4G)';
-            statusEl.className = 'text-xs font-extrabold uppercase tracking-wider text-red-600';
-          }
-        }
-      );
+        } catch (e) {}
+      }, 1000);
     }
 
     function updateLobbyPlayersDOM() {
@@ -610,7 +608,7 @@
 
     function togglePause() {
       state.paused = !state.paused;
-      broadcastHostCommand(true);
+      broadcastHostCommand();
       render();
     }
 
@@ -619,7 +617,7 @@
       SoundEngine.mode = 'lobby';
       state.status = 'lobby';
       state.paused = false;
-      broadcastHostCommand(true);
+      broadcastHostCommand();
       render();
     }
 
@@ -635,7 +633,7 @@
       state.currentQuestion = qIdx;
       state.remainingTime = state.questions[qIdx].timer || 20;
       state.questionStartTime = Date.now();
-      broadcastHostCommand(true);
+      broadcastHostCommand();
       render();
     }
 
@@ -645,7 +643,7 @@
       SoundEngine.jingleReveal();
       state.status = 'reveal';
       state.paused = false;
-      broadcastHostCommand(true);
+      broadcastHostCommand();
       render();
     }
 
@@ -654,7 +652,7 @@
       state.status = isLast ? 'podium' : 'leaderboard';
       state.paused = false;
       if (isLast) SoundEngine.jingleReveal();
-      broadcastHostCommand(true);
+      broadcastHostCommand();
       render();
     }
 
@@ -668,9 +666,7 @@
           <div class="card-cream p-8 md:p-10">
             <div class="flex justify-between items-center mb-6">
               <button onclick="goHome()" class="text-xs font-bold text-[#168049] hover:underline cursor-pointer">← Retour à l'accueil</button>
-              <span id="net-status" class="text-xs font-extrabold uppercase tracking-wider ${state.netConnected ? 'text-[#168049]' : 'text-amber-600'}">
-                ${state.netConnected ? 'Salle en ligne' : 'Connexion...'}
-              </span>
+              <span id="net-status" class="text-xs font-extrabold uppercase tracking-wider text-amber-600">Création de la salle...</span>
             </div>
 
             <div class="grid grid-cols-1 md:grid-cols-12 gap-8 items-center bg-white p-6 md:p-8 rounded-2xl border border-[#0E5A36]/15 shadow-sm mb-8">
@@ -737,6 +733,7 @@
                 </span>
               </div>
               <div class="flex items-center gap-3">
+                <span id="net-status" class="text-[10px] font-bold uppercase text-[#168049]">Salle en ligne</span>
                 <button onclick="togglePause()" class="px-4 py-2 rounded-xl ${state.paused ? 'bg-amber-500 text-white' : 'bg-white text-[#0E5A36] border border-[#0E5A36]/20'} font-extrabold text-xs uppercase tracking-wider cursor-pointer shadow-sm">
                   ${state.paused ? '▶ Reprendre' : '❚❚ Pause'}
                 </button>
@@ -955,7 +952,7 @@
       `;
     }
 
-    function handleJoinSubmit(e) {
+    async function handleJoinSubmit(e) {
       e.preventDefault();
       const pin = document.getElementById('join-pin').value.trim();
       const pseudo = document.getElementById('join-pseudo').value.trim();
@@ -965,107 +962,125 @@
       btn.disabled = true;
       btn.textContent = "Connexion...";
 
-      cleanupNetwork();
-      state.pin = pin;
-      state.pseudo = pseudo;
-      state.status = 'lobby';
-      state.paused = false;
-      state.currentQuestion = 0;
-      state.totalQuestions = state.questions.length;
-      state.activeQuestionObj = null;
-      state.selectedAnswer = null;
-      state.myScore = 0;
-      state.myLastPoints = 0;
-      state.myRank = 0;
-      state.seq = 0;
-      SafeStorage.set('quiz_ce_2026_pseudo', pseudo);
-
-      connectBroker(
-        0,
-        (client) => {
-          client.subscribe(`carrefour/ce2026/${pin}/state`);
-          client.publish(`carrefour/ce2026/${pin}/in`, JSON.stringify({
-            t: 'join',
-            id: state.playerId,
-            n: pseudo
-          }), { qos: 1 });
-          state.view = 'player';
-          render();
-        },
-        (topic, latestCmd) => {
-          if (!latestCmd || typeof latestCmd.seq !== 'number') return;
-
-          if (latestCmd.seq > state.seq) {
-            const prevQ = state.currentQuestion;
-            const prevStatus = state.status;
-            state.seq = latestCmd.seq;
-            state.status = latestCmd.st;
-            state.paused = latestCmd.pz === 1;
-            state.currentQuestion = latestCmd.q;
-            if (latestCmd.tot) state.totalQuestions = latestCmd.tot;
-
-            if (latestCmd.qd) {
-              state.activeQuestionObj = {
-                question: latestCmd.qd.t,
-                options: latestCmd.qd.o,
-                correct: latestCmd.qd.c,
-                timer: latestCmd.qd.tm || 20
-              };
-            }
-
-            if (latestCmd.st === 'question' && (prevQ !== latestCmd.q || prevStatus !== 'question')) {
-              if (!state.paused) {
-                state.selectedAnswer = null;
-                state.questionStartTime = Date.now();
-              }
-            }
-
-            if (latestCmd.st === 'reveal' && prevStatus !== 'reveal') {
-              const qObj = state.activeQuestionObj || state.questions[latestCmd.q];
-              if (qObj && state.selectedAnswer === qObj.correct) {
-                const elapsed = Math.max(0, (Date.now() - state.questionStartTime) / 1000);
-                const maxTime = qObj.timer || 20;
-                const pts = Math.round(500 + 500 * Math.max(0, Math.min(1, 1 - (elapsed / maxTime))));
-                state.myLastPoints = pts;
-                state.myScore += pts;
-              } else {
-                state.myLastPoints = 0;
-              }
-            }
-
-            if (Array.isArray(latestCmd.rk)) {
-              const idx = latestCmd.rk.findIndex(item => item[0] === state.playerId);
-              if (idx !== -1) {
-                state.myRank = idx + 1;
-                state.myScore = latestCmd.rk[idx][1];
-              }
-            }
-
-            render();
-          }
-        },
-        () => {
-          alert("Impossible de se connecter au réseau depuis le téléphone. Vérifiez votre connexion internet.");
+      try {
+        const cmds = await httpReadAll(`ce2026_cmd_${pin}`);
+        if (!cmds || cmds.length === 0) {
+          alert("Code PIN introuvable (" + pin + "). Vérifiez le code affiché sur l'écran principal.");
           btn.disabled = false;
           btn.textContent = "Entrer dans la partie";
+          return;
         }
-      );
+
+        cleanupNetwork();
+        state.pin = pin;
+        state.pseudo = pseudo;
+        state.status = 'lobby';
+        state.paused = false;
+        state.currentQuestion = 0;
+        state.totalQuestions = state.questions.length;
+        state.activeQuestionObj = null;
+        state.selectedAnswer = null;
+        state.myScore = 0;
+        state.myLastPoints = 0;
+        state.myRank = 0;
+        state.seq = 0;
+        SafeStorage.set('quiz_ce_2026_pseudo', pseudo);
+
+        await httpPost(`ce2026_in_${pin}`, {
+          t: 'join',
+          id: state.playerId,
+          n: pseudo
+        });
+
+        state.view = 'player';
+        render();
+
+        const syncState = async () => {
+          try {
+            const list = await httpReadAll(`ce2026_cmd_${pin}`);
+            if (!list || list.length === 0) return;
+
+            let latestCmd = null;
+            list.forEach(c => {
+              if (c && typeof c.seq === 'number') {
+                if (!latestCmd || c.seq > latestCmd.seq) latestCmd = c;
+              }
+            });
+
+            if (latestCmd && latestCmd.seq > state.seq) {
+              const prevQ = state.currentQuestion;
+              const prevStatus = state.status;
+              state.seq = latestCmd.seq;
+              state.status = latestCmd.st;
+              state.paused = latestCmd.pz === 1;
+              state.currentQuestion = latestCmd.q;
+              if (latestCmd.tot) state.totalQuestions = latestCmd.tot;
+
+              if (latestCmd.qd) {
+                state.activeQuestionObj = {
+                  question: latestCmd.qd.t,
+                  options: latestCmd.qd.o,
+                  correct: latestCmd.qd.c,
+                  timer: latestCmd.qd.tm || 20
+                };
+              }
+
+              if (latestCmd.st === 'question' && (prevQ !== latestCmd.q || prevStatus !== 'question')) {
+                if (!state.paused) {
+                  state.selectedAnswer = null;
+                  state.questionStartTime = Date.now();
+                }
+              }
+
+              if (latestCmd.st === 'reveal' && prevStatus !== 'reveal') {
+                const qObj = state.activeQuestionObj || state.questions[latestCmd.q];
+                if (qObj && state.selectedAnswer === qObj.correct) {
+                  const elapsed = Math.max(0, (Date.now() - state.questionStartTime) / 1000);
+                  const maxTime = qObj.timer || 20;
+                  const pts = Math.round(500 + 500 * Math.max(0, Math.min(1, 1 - (elapsed / maxTime))));
+                  state.myLastPoints = pts;
+                  state.myScore += pts;
+                } else {
+                  state.myLastPoints = 0;
+                }
+              }
+
+              if (Array.isArray(latestCmd.rk)) {
+                const idx = latestCmd.rk.findIndex(item => item[0] === state.playerId);
+                if (idx !== -1) {
+                  state.myRank = idx + 1;
+                  state.myScore = latestCmd.rk[idx][1];
+                }
+              }
+
+              render();
+            }
+          } catch (err) {}
+        };
+
+        await syncState();
+        state.pollInterval = setInterval(syncState, 900);
+      } catch (err) {
+        alert("Erreur de connexion réseau. Vérifiez votre connexion internet.");
+        btn.disabled = false;
+        btn.textContent = "Entrer dans la partie";
+      }
     }
 
-    function handlePlayerAnswer(answerIdx) {
+    async function handlePlayerAnswer(answerIdx) {
       if (state.selectedAnswer !== null || state.paused) return;
       state.selectedAnswer = answerIdx;
       render();
 
-      if (state.mqttClient && state.netConnected) {
-        state.mqttClient.publish(`carrefour/ce2026/${state.pin}/in`, JSON.stringify({
+      try {
+        await httpPost(`ce2026_in_${state.pin}`, {
           t: 'ans',
           id: state.playerId,
           n: state.pseudo,
           q: state.currentQuestion,
           a: answerIdx
-        }), { qos: 1 });
-      }
+        });
+      } catch (e) {}
     }
 
     function renderPlayer(app) {
