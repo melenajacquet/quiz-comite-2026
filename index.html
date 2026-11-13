@@ -6,6 +6,7 @@
   <title>Quiz Comité Echange 2026</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
   <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@500;600;700;800;900&display=swap" rel="stylesheet">
   <style>
     body {
@@ -195,7 +196,6 @@
       questions: savedQuestions || JSON.parse(JSON.stringify(DEFAULT_QUESTIONS)),
       pin: '',
       pinLocked: false,
-      roomToken: '', // Format "driver:id" encodé dans le QR code
       status: 'lobby',
       paused: false,
       remainingTime: 20,
@@ -212,8 +212,11 @@
       myLastPoints: 0,
       myRank: 0,
       timerInterval: null,
-      pollInterval: null,
-      seq: 0
+      seq: 0,
+      peer: null,
+      hostConns: {},
+      playerConn: null,
+      netReady: false
     };
 
     SafeStorage.set('quiz_ce_2026_pid', state.playerId);
@@ -293,9 +296,14 @@
 
     function cleanupNetwork() {
       if (state.timerInterval) clearInterval(state.timerInterval);
-      if (state.pollInterval) clearInterval(state.pollInterval);
       state.timerInterval = null;
-      state.pollInterval = null;
+      if (state.peer) {
+        try { state.peer.destroy(); } catch (e) {}
+        state.peer = null;
+      }
+      state.hostConns = {};
+      state.playerConn = null;
+      state.netReady = false;
     }
 
     function goHome() {
@@ -442,213 +450,10 @@
       startHostSession();
     }
 
-    // --- RÉSEAU MULTI-SERVEURS COMPATIBLE TOUS PARE-FEUX ---
-    const CloudBus = {
-      async fetchWithTimeout(url, opts = {}, ms = 4500) {
-        const ctrl = new AbortController();
-        const id = setTimeout(() => ctrl.abort(), ms);
-        try {
-          const res = await fetch(url, { ...opts, signal: ctrl.signal, cache: 'no-store' });
-          clearTimeout(id);
-          return res;
-        } catch (e) {
-          clearTimeout(id);
-          throw e;
-        }
-      },
-
-      // Crée un canal de session sur le premier serveur accessible par le réseau de l'utilisateur
-      async createRoom(initialData) {
-        const bodyStr = JSON.stringify(initialData);
-
-        // 1. Essai avec JSONBlob (HTTPS standard)
-        try {
-          const res = await this.fetchWithTimeout('https://jsonblob.com/api/jsonBlob', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-            body: bodyStr
-          });
-          if (res.ok) {
-            const loc = res.headers.get('Location') || res.headers.get('x-jsonblob');
-            if (loc) {
-              const id = loc.split('/').pop();
-              return `jb_${id}`;
-            }
-          }
-        } catch (e) {}
-
-        // 2. Secours automatique sur KVdb (autorisé par quasi tous les pare-feux d'entreprise)
-        try {
-          const bucketRes = await this.fetchWithTimeout('https://kvdb.io', { method: 'POST' });
-          if (bucketRes.ok) {
-            const bucketId = (await bucketRes.text()).trim();
-            if (bucketId) {
-              await this.fetchWithTimeout(`https://kvdb.io/${bucketId}/room`, {
-                method: 'POST',
-                body: bodyStr
-              });
-              return `kv_${bucketId}`;
-            }
-          }
-        } catch (e) {}
-
-        // 3. Secours ntfy.sh
-        try {
-          const randId = Math.random().toString(36).substring(2, 10);
-          const res = await this.fetchWithTimeout(`https://ntfy.sh/ce26_r_${randId}`, {
-            method: 'POST',
-            body: bodyStr
-          });
-          if (res.ok) return `nt_${randId}`;
-        } catch (e) {}
-
-        return null;
-      },
-
-      async writeHostState(token, data) {
-        const bodyStr = JSON.stringify(data);
-        try {
-          if (token.startsWith('jb_')) {
-            const id = token.slice(3);
-            const res = await this.fetchWithTimeout(`https://jsonblob.com/api/jsonBlob/${id}`, {
-              method: 'PUT',
-              headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-              body: bodyStr
-            });
-            return res.ok;
-          }
-          if (token.startsWith('kv_')) {
-            const bucket = token.slice(3);
-            const res = await this.fetchWithTimeout(`https://kvdb.io/${bucket}/room`, {
-              method: 'POST',
-              body: bodyStr
-            });
-            return res.ok;
-          }
-          if (token.startsWith('nt_')) {
-            const ch = token.slice(3);
-            const res = await this.fetchWithTimeout(`https://ntfy.sh/ce26_r_${ch}`, {
-              method: 'POST',
-              body: bodyStr
-            });
-            return res.ok;
-          }
-        } catch (e) {}
-        return false;
-      },
-
-      async readHostState(token) {
-        try {
-          if (token.startsWith('jb_')) {
-            const id = token.slice(3);
-            const res = await this.fetchWithTimeout(`https://jsonblob.com/api/jsonBlob/${id}?_t=${Date.now()}`, {
-              headers: { 'Accept': 'application/json' }
-            });
-            if (res.ok) return await res.json();
-          }
-          if (token.startsWith('kv_')) {
-            const bucket = token.slice(3);
-            const res = await this.fetchWithTimeout(`https://kvdb.io/${bucket}/room?_t=${Date.now()}`);
-            if (res.ok) return await res.json();
-          }
-          if (token.startsWith('nt_')) {
-            const ch = token.slice(3);
-            const res = await this.fetchWithTimeout(`https://ntfy.sh/ce26_r_${ch}/json?poll=1&since=all&_t=${Date.now()}`);
-            if (res.ok) {
-              const txt = await res.text();
-              let latest = null;
-              txt.trim().split('\n').forEach(l => {
-                try {
-                  const ev = JSON.parse(l);
-                  if (ev && ev.event === 'message' && ev.message) {
-                    const p = JSON.parse(ev.message);
-                    if (!latest || p.seq > latest.seq) latest = p;
-                  }
-                } catch (e) {}
-              });
-              return latest;
-            }
-          }
-        } catch (e) {}
-        return null;
-      },
-
-      // Chaque joueur écrit dans sa propre clé (aucun écrasement possible)
-      async sendPlayerAction(token, playerId, actionObj) {
-        const bodyStr = JSON.stringify(actionObj);
-        try {
-          if (token.startsWith('kv_')) {
-            const bucket = token.slice(3);
-            const res = await this.fetchWithTimeout(`https://kvdb.io/${bucket}/p_${playerId}`, {
-              method: 'POST',
-              body: bodyStr
-            });
-            return res.ok;
-          }
-          if (token.startsWith('jb_')) {
-            const id = token.slice(3);
-            const cur = await this.readHostState(token);
-            if (!cur) return false;
-            if (!cur.inbox) cur.inbox = {};
-            cur.inbox[playerId] = actionObj;
-            return await this.writeHostState(token, cur);
-          }
-          if (token.startsWith('nt_')) {
-            const ch = token.slice(3);
-            const res = await this.fetchWithTimeout(`https://ntfy.sh/ce26_in_${ch}`, {
-              method: 'POST',
-              body: bodyStr
-            });
-            return res.ok;
-          }
-        } catch (e) {}
-        return false;
-      },
-
-      async readPlayerActions(token, knownPlayerIds) {
-        const actions = [];
-        try {
-          if (token.startsWith('kv_')) {
-            const bucket = token.slice(3);
-            const listRes = await this.fetchWithTimeout(`https://kvdb.io/${bucket}/?values=true&format=json&_t=${Date.now()}`);
-            if (listRes.ok) {
-              const pairs = await listRes.json();
-              if (Array.isArray(pairs)) {
-                pairs.forEach(([k, v]) => {
-                  if (k.startsWith('p_')) {
-                    try { actions.push(JSON.parse(v)); } catch (e) {}
-                  }
-                });
-              }
-            }
-          } else if (token.startsWith('jb_')) {
-            const cur = await this.readHostState(token);
-            if (cur && cur.inbox) {
-              Object.values(cur.inbox).forEach(act => actions.push(act));
-            }
-          } else if (token.startsWith('nt_')) {
-            const ch = token.slice(3);
-            const res = await this.fetchWithTimeout(`https://ntfy.sh/ce26_in_${ch}/json?poll=1&since=all&_t=${Date.now()}`);
-            if (res.ok) {
-              const txt = await res.text();
-              txt.trim().split('\n').forEach(l => {
-                try {
-                  const ev = JSON.parse(l);
-                  if (ev && ev.event === 'message' && ev.message) actions.push(JSON.parse(ev.message));
-                } catch (e) {}
-              });
-            }
-          }
-        } catch (e) {}
-        return actions;
-      }
-    };
-
+    // --- RÉSEAU DIRECT WEBRTC (PEERJS CLOUD PORT 443) ---
     function buildHostPayload() {
-      state.seq++;
       const qObj = state.questions[state.currentQuestion];
       const payload = {
-        pin: state.pin,
         seq: state.seq,
         st: state.status,
         pz: state.paused ? 1 : 0,
@@ -670,66 +475,72 @@
       return payload;
     }
 
-    async function broadcastHostCommand() {
-      if (!state.roomToken) return;
+    function broadcastHostCommand(incrementSeq = true) {
+      if (incrementSeq) state.seq++;
       const payload = buildHostPayload();
-      const ok = await CloudBus.writeHostState(state.roomToken, payload);
-      const statusEl = document.getElementById('net-status');
-      if (statusEl) {
-        statusEl.textContent = ok ? 'Salle en ligne' : 'Reconnexion...';
-        statusEl.className = `text-xs font-extrabold uppercase tracking-wider ${ok ? 'text-[#168049]' : 'text-amber-600'}`;
-      }
+      Object.values(state.hostConns).forEach(conn => {
+        if (conn && conn.open) {
+          try { conn.send(payload); } catch (e) {}
+        }
+      });
     }
 
-    async function startHostSession() {
+    function startHostSession() {
       cleanupNetwork();
       const pin = Math.floor(100000 + Math.random() * 900000).toString();
       state.pin = pin;
-      state.roomToken = '';
       state.view = 'host';
       state.status = 'lobby';
       state.paused = false;
       state.currentQuestion = 0;
       state.players = {};
       state.answers = {};
-      state.seq = 0;
+      state.seq = 1;
       SoundEngine.mode = 'lobby';
-      render();
+      render(); // Affiche le QR code immédiatement sans bloquer l'écran
 
-      const initialData = buildHostPayload();
-      const token = await CloudBus.createRoom(initialData);
-
-      const statusEl = document.getElementById('net-status');
-      if (!token) {
-        if (statusEl) {
-          statusEl.textContent = 'Réseau bloqué (activez la 4G sur le PC)';
-          statusEl.className = 'text-xs font-extrabold uppercase tracking-wider text-red-600';
+      const peerId = `quiz-ce2026-room-${pin}`;
+      const peer = new Peer(peerId, {
+        secure: true,
+        config: {
+          iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' }
+          ]
         }
-        return;
-      }
+      });
 
-      state.roomToken = token;
-      // Enregistre le code PIN court sur un annuaire public si les joueurs tapent le PIN à la main
-      CloudBus.fetchWithTimeout(`https://kvdb.io/8kX9vP2mQ7nL4wR1tY6zB3/pin_${pin}`, {
-        method: 'POST',
-        body: token
-      }).catch(() => {});
+      state.peer = peer;
 
-      render(); // Génère le QR code contenant directement le token universel
+      peer.on('open', () => {
+        state.netReady = true;
+        const statusEl = document.getElementById('net-status');
+        if (statusEl) {
+          statusEl.textContent = 'Salle en ligne (Prêt)';
+          statusEl.className = 'text-xs font-extrabold uppercase tracking-wider text-[#168049]';
+        }
+      });
 
-      state.pollInterval = setInterval(async () => {
-        const actions = await CloudBus.readPlayerActions(state.roomToken, Object.keys(state.players));
-        actions.forEach(msg => {
+      peer.on('connection', (conn) => {
+        conn.on('open', () => {
+          state.hostConns[conn.peer] = conn;
+          // Envoie immédiatement l'état en cours au téléphone qui se connecte
+          try { conn.send(buildHostPayload()); } catch (e) {}
+        });
+
+        conn.on('data', (msg) => {
           if (!msg || !msg.id) return;
+          state.hostConns[msg.id] = conn;
 
-          if (!state.players[msg.id]) {
-            state.players[msg.id] = { id: msg.id, pseudo: msg.n || 'Joueur', score: 0, lastPoints: 0 };
+          if (msg.t === 'join') {
+            if (!state.players[msg.id]) {
+              state.players[msg.id] = { id: msg.id, pseudo: msg.n || 'Joueur', score: 0, lastPoints: 0 };
+            } else {
+              state.players[msg.id].pseudo = msg.n || state.players[msg.id].pseudo;
+            }
             if (state.status === 'lobby') updateLobbyPlayersDOM();
-          } else if (msg.n) {
-            state.players[msg.id].pseudo = msg.n;
-          }
-
-          if (typeof msg.a === 'number' && typeof msg.q === 'number') {
+            try { conn.send(buildHostPayload()); } catch (e) {}
+          } else if (msg.t === 'ans') {
             if (state.status !== 'question' || state.paused || state.currentQuestion !== msg.q) return;
             const qKey = 'q_' + msg.q;
             if (!state.answers[qKey]) state.answers[qKey] = {};
@@ -742,6 +553,9 @@
             const points = isCorrect ? Math.round(500 + 500 * Math.max(0, Math.min(1, 1 - (elapsed / maxTime)))) : 0;
 
             state.answers[qKey][msg.id] = { answerIndex: msg.a, isCorrect, points };
+            if (!state.players[msg.id]) {
+              state.players[msg.id] = { id: msg.id, pseudo: msg.n || 'Joueur', score: 0, lastPoints: 0 };
+            }
             state.players[msg.id].score += points;
             state.players[msg.id].lastPoints = points;
 
@@ -755,7 +569,19 @@
             }
           }
         });
-      }, 1000);
+
+        conn.on('close', () => {
+          delete state.hostConns[conn.peer];
+        });
+      });
+
+      peer.on('error', (err) => {
+        const statusEl = document.getElementById('net-status');
+        if (statusEl) {
+          statusEl.textContent = 'Erreur réseau (' + (err.type || 'connexion') + ')';
+          statusEl.className = 'text-xs font-extrabold uppercase tracking-wider text-red-600';
+        }
+      });
     }
 
     function updateLobbyPlayersDOM() {
@@ -771,7 +597,7 @@
 
     function togglePause() {
       state.paused = !state.paused;
-      broadcastHostCommand();
+      broadcastHostCommand(true);
       render();
     }
 
@@ -780,7 +606,7 @@
       SoundEngine.mode = 'lobby';
       state.status = 'lobby';
       state.paused = false;
-      broadcastHostCommand();
+      broadcastHostCommand(true);
       render();
     }
 
@@ -796,7 +622,7 @@
       state.currentQuestion = qIdx;
       state.remainingTime = state.questions[qIdx].timer || 20;
       state.questionStartTime = Date.now();
-      broadcastHostCommand();
+      broadcastHostCommand(true);
       render();
     }
 
@@ -806,7 +632,7 @@
       SoundEngine.jingleReveal();
       state.status = 'reveal';
       state.paused = false;
-      broadcastHostCommand();
+      broadcastHostCommand(true);
       render();
     }
 
@@ -815,7 +641,7 @@
       state.status = isLast ? 'podium' : 'leaderboard';
       state.paused = false;
       if (isLast) SoundEngine.jingleReveal();
-      broadcastHostCommand();
+      broadcastHostCommand(true);
       render();
     }
 
@@ -823,31 +649,27 @@
       if (state.status === 'lobby') {
         const players = Object.values(state.players);
         const baseUrl = window.location.href.split('?')[0].split('#')[0];
-        const joinUrl = state.roomToken
-          ? `${baseUrl}?pin=${state.pin}&r=${encodeURIComponent(state.roomToken)}`
-          : `${baseUrl}?pin=${state.pin}`;
+        const joinUrl = `${baseUrl}?pin=${state.pin}`;
 
         app.innerHTML = `
           <div class="card-cream p-8 md:p-10">
             <div class="flex justify-between items-center mb-6">
               <button onclick="goHome()" class="text-xs font-bold text-[#168049] hover:underline cursor-pointer">← Retour à l'accueil</button>
-              <span id="net-status" class="text-xs font-extrabold uppercase tracking-wider ${state.roomToken ? 'text-[#168049]' : 'text-amber-600'}">
-                ${state.roomToken ? 'Salle en ligne' : 'Connexion au réseau...'}
+              <span id="net-status" class="text-xs font-extrabold uppercase tracking-wider ${state.netReady ? 'text-[#168049]' : 'text-amber-600'}">
+                ${state.netReady ? 'Salle en ligne (Prêt)' : 'Ouverture de la salle...'}
               </span>
             </div>
 
             <div class="grid grid-cols-1 md:grid-cols-12 gap-8 items-center bg-white p-6 md:p-8 rounded-2xl border border-[#0E5A36]/15 shadow-sm mb-8">
               <div class="md:col-span-4 flex flex-col items-center justify-center border-b md:border-b-0 md:border-r border-stone-200 pb-6 md:pb-0 md:pr-6">
-                <div id="qrcode-box" class="p-3 bg-white rounded-xl border-2 border-[#0E5A36]/20 shadow-sm mb-3 min-w-[185px] min-h-[185px] flex items-center justify-center">
-                  ${state.roomToken ? '' : '<span class="text-xs text-stone-400 font-bold">Création de la salle...</span>'}
-                </div>
+                <div id="qrcode-box" class="p-3 bg-white rounded-xl border-2 border-[#0E5A36]/20 shadow-sm mb-3"></div>
                 <span class="text-xs font-bold text-[#0E5A36] text-center">Scannez pour entrer directement</span>
               </div>
               <div class="md:col-span-8 text-center md:text-left">
                 <p class="text-xs font-bold uppercase tracking-wider text-[#168049] mb-1">Code de la session</p>
                 <div class="text-5xl md:text-7xl font-black text-[#0E5A36] tracking-widest my-2 select-all">${state.pin}</div>
                 <p class="text-xs text-stone-500 break-all mb-6">${escapeHtml(joinUrl)}</p>
-                <button onclick="hostNextQuestion(0)" ${state.roomToken ? '' : 'disabled'} class="btn-primary px-8 py-4 rounded-xl font-extrabold text-lg shadow-lg cursor-pointer disabled:opacity-50">
+                <button onclick="hostNextQuestion(0)" class="btn-primary px-8 py-4 rounded-xl font-extrabold text-lg shadow-lg cursor-pointer">
                   Démarrer le quiz (${state.questions.length} questions)
                 </button>
               </div>
@@ -866,22 +688,20 @@
             </div>
           </div>
         `;
-        if (state.roomToken) {
-          setTimeout(() => {
-            const qrBox = document.getElementById('qrcode-box');
-            if (qrBox) {
-              qrBox.innerHTML = '';
-              new QRCode(qrBox, {
-                text: joinUrl,
-                width: 185,
-                height: 185,
-                colorDark: "#0E5A36",
-                colorLight: "#FFFFFF",
-                correctLevel: QRCode.CorrectLevel.M
-              });
-            }
-          }, 30);
-        }
+        setTimeout(() => {
+          const qrBox = document.getElementById('qrcode-box');
+          if (qrBox) {
+            qrBox.innerHTML = '';
+            new QRCode(qrBox, {
+              text: joinUrl,
+              width: 185,
+              height: 185,
+              colorDark: "#0E5A36",
+              colorLight: "#FFFFFF",
+              correctLevel: QRCode.CorrectLevel.M
+            });
+          }
+        }, 30);
         return;
       }
 
@@ -904,7 +724,6 @@
                 </span>
               </div>
               <div class="flex items-center gap-3">
-                <span id="net-status" class="text-[10px] font-bold uppercase text-[#168049]">Salle en ligne</span>
                 <button onclick="togglePause()" class="px-4 py-2 rounded-xl ${state.paused ? 'bg-amber-500 text-white' : 'bg-white text-[#0E5A36] border border-[#0E5A36]/20'} font-extrabold text-xs uppercase tracking-wider cursor-pointer shadow-sm">
                   ${state.paused ? '▶ Reprendre' : '❚❚ Pause'}
                 </button>
@@ -1073,22 +892,18 @@
     }
 
     // --- JOUEUR (TÉLÉPHONE) ---
-    function openJoinView(prefillPin = '', locked = false, roomToken = '') {
+    function openJoinView(prefillPin = '', locked = false) {
       cleanupNetwork();
       state.view = 'join';
       if (prefillPin) {
         state.pin = prefillPin;
         state.pinLocked = locked;
       }
-      if (roomToken) {
-        state.roomToken = roomToken;
-      }
       render();
     }
 
     function unlockPinField() {
       state.pinLocked = false;
-      state.roomToken = '';
       render();
     }
 
@@ -1127,16 +942,7 @@
       `;
     }
 
-    let playerSyncFn = null;
-
-    async function manualPlayerRefresh() {
-      const btn = document.getElementById('manual-sync-btn');
-      if (btn) btn.textContent = 'Actualisation...';
-      if (playerSyncFn) await playerSyncFn();
-      if (btn) btn.textContent = 'Actualiser l\'écran';
-    }
-
-    async function handleJoinSubmit(e) {
+    function handleJoinSubmit(e) {
       e.preventDefault();
       const pin = document.getElementById('join-pin').value.trim();
       const pseudo = document.getElementById('join-pseudo').value.trim();
@@ -1144,26 +950,10 @@
       if (!pin || !pseudo) return;
 
       btn.disabled = true;
-      btn.textContent = "Connexion...";
-
-      let token = state.roomToken;
-      if (!token) {
-        try {
-          const res = await CloudBus.fetchWithTimeout(`https://kvdb.io/8kX9vP2mQ7nL4wR1tY6zB3/pin_${pin}?_t=${Date.now()}`);
-          if (res.ok) token = (await res.text()).trim();
-        } catch (err) {}
-      }
-
-      if (!token) {
-        alert("Session introuvable. Scannez directement le QR code affiché à l'écran.");
-        btn.disabled = false;
-        btn.textContent = "Entrer dans la partie";
-        return;
-      }
+      btn.textContent = "Connexion à la salle...";
 
       cleanupNetwork();
       state.pin = pin;
-      state.roomToken = token;
       state.pseudo = pseudo;
       state.status = 'lobby';
       state.paused = false;
@@ -1177,83 +967,120 @@
       state.seq = 0;
       SafeStorage.set('quiz_ce_2026_pseudo', pseudo);
 
-      await CloudBus.sendPlayerAction(token, state.playerId, {
-        id: state.playerId,
-        n: pseudo
+      const peer = new Peer({
+        secure: true,
+        config: {
+          iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' }
+          ]
+        }
       });
 
-      state.view = 'player';
-      render();
+      state.peer = peer;
 
-      playerSyncFn = async () => {
-        const latestCmd = await CloudBus.readHostState(token);
-        if (!latestCmd || typeof latestCmd.seq !== 'number') return;
-
-        if (latestCmd.seq > state.seq) {
-          const prevQ = state.currentQuestion;
-          const prevStatus = state.status;
-          state.seq = latestCmd.seq;
-          state.status = latestCmd.st;
-          state.paused = latestCmd.pz === 1;
-          state.currentQuestion = latestCmd.q;
-          if (latestCmd.tot) state.totalQuestions = latestCmd.tot;
-
-          if (latestCmd.qd) {
-            state.activeQuestionObj = {
-              question: latestCmd.qd.t,
-              options: latestCmd.qd.o,
-              correct: latestCmd.qd.c,
-              timer: latestCmd.qd.tm || 20
-            };
-          }
-
-          if (latestCmd.st === 'question' && (prevQ !== latestCmd.q || prevStatus !== 'question')) {
-            if (!state.paused) {
-              state.selectedAnswer = null;
-              state.questionStartTime = Date.now();
-            }
-          }
-
-          if (latestCmd.st === 'reveal' && prevStatus !== 'reveal') {
-            const qObj = state.activeQuestionObj || state.questions[latestCmd.q];
-            if (qObj && state.selectedAnswer === qObj.correct) {
-              const elapsed = Math.max(0, (Date.now() - state.questionStartTime) / 1000);
-              const maxTime = qObj.timer || 20;
-              const pts = Math.round(500 + 500 * Math.max(0, Math.min(1, 1 - (elapsed / maxTime))));
-              state.myLastPoints = pts;
-              state.myScore += pts;
-            } else {
-              state.myLastPoints = 0;
-            }
-          }
-
-          if (Array.isArray(latestCmd.rk)) {
-            const idx = latestCmd.rk.findIndex(item => item[0] === state.playerId);
-            if (idx !== -1) {
-              state.myRank = idx + 1;
-              state.myScore = latestCmd.rk[idx][1];
-            }
-          }
-
-          render();
+      const failTimer = setTimeout(() => {
+        if (!state.netReady) {
+          alert("Impossible de joindre la salle " + pin + ". Vérifiez le code PIN ou que l'écran animateur est bien ouvert.");
+          btn.disabled = false;
+          btn.textContent = "Entrer dans la partie";
         }
-      };
+      }, 7000);
 
-      await playerSyncFn();
-      state.pollInterval = setInterval(playerSyncFn, 1000);
+      peer.on('open', () => {
+        const conn = peer.connect(`quiz-ce2026-room-${pin}`, { reliable: true });
+        state.playerConn = conn;
+
+        conn.on('open', () => {
+          clearTimeout(failTimer);
+          state.netReady = true;
+          conn.send({
+            t: 'join',
+            id: state.playerId,
+            n: pseudo
+          });
+          state.view = 'player';
+          render();
+        });
+
+        conn.on('data', (latestCmd) => {
+          if (!latestCmd || typeof latestCmd.seq !== 'number') return;
+
+          if (latestCmd.seq > state.seq) {
+            const prevQ = state.currentQuestion;
+            const prevStatus = state.status;
+            state.seq = latestCmd.seq;
+            state.status = latestCmd.st;
+            state.paused = latestCmd.pz === 1;
+            state.currentQuestion = latestCmd.q;
+            if (latestCmd.tot) state.totalQuestions = latestCmd.tot;
+
+            if (latestCmd.qd) {
+              state.activeQuestionObj = {
+                question: latestCmd.qd.t,
+                options: latestCmd.qd.o,
+                correct: latestCmd.qd.c,
+                timer: latestCmd.qd.tm || 20
+              };
+            }
+
+            if (latestCmd.st === 'question' && (prevQ !== latestCmd.q || prevStatus !== 'question')) {
+              if (!state.paused) {
+                state.selectedAnswer = null;
+                state.questionStartTime = Date.now();
+              }
+            }
+
+            if (latestCmd.st === 'reveal' && prevStatus !== 'reveal') {
+              const qObj = state.activeQuestionObj || state.questions[latestCmd.q];
+              if (qObj && state.selectedAnswer === qObj.correct) {
+                const elapsed = Math.max(0, (Date.now() - state.questionStartTime) / 1000);
+                const maxTime = qObj.timer || 20;
+                const pts = Math.round(500 + 500 * Math.max(0, Math.min(1, 1 - (elapsed / maxTime))));
+                state.myLastPoints = pts;
+                state.myScore += pts;
+              } else {
+                state.myLastPoints = 0;
+              }
+            }
+
+            if (Array.isArray(latestCmd.rk)) {
+              const idx = latestCmd.rk.findIndex(item => item[0] === state.playerId);
+              if (idx !== -1) {
+                state.myRank = idx + 1;
+                state.myScore = latestCmd.rk[idx][1];
+              }
+            }
+
+            render();
+          }
+        });
+      });
+
+      peer.on('error', () => {
+        clearTimeout(failTimer);
+        alert("Salle introuvable. Vérifiez le code PIN affiché à l'écran.");
+        btn.disabled = false;
+        btn.textContent = "Entrer dans la partie";
+      });
     }
 
-    async function handlePlayerAnswer(answerIdx) {
+    function handlePlayerAnswer(answerIdx) {
       if (state.selectedAnswer !== null || state.paused) return;
       state.selectedAnswer = answerIdx;
       render();
 
-      await CloudBus.sendPlayerAction(state.roomToken, state.playerId, {
-        id: state.playerId,
-        n: state.pseudo,
-        q: state.currentQuestion,
-        a: answerIdx
-      });
+      if (state.playerConn && state.playerConn.open) {
+        try {
+          state.playerConn.send({
+            t: 'ans',
+            id: state.playerId,
+            n: state.pseudo,
+            q: state.currentQuestion,
+            a: answerIdx
+          });
+        } catch (e) {}
+      }
     }
 
     function renderPlayer(app) {
@@ -1263,10 +1090,7 @@
             <span class="inline-block px-3 py-1 rounded-full bg-[#0E5A36]/10 text-[#0E5A36] font-bold text-xs mb-4">Connecté (Session ${escapeHtml(state.pin)})</span>
             <h2 class="text-2xl font-black text-[#0E5A36] mb-2">Bienvenue, ${escapeHtml(state.pseudo)}</h2>
             <p class="text-sm text-stone-600 font-medium mb-6">Votre nom apparaît à l'écran. La partie va bientôt commencer.</p>
-            <div class="w-10 h-10 border-4 border-[#168049] border-t-transparent rounded-full animate-spin mx-auto mb-6"></div>
-            <button id="manual-sync-btn" onclick="manualPlayerRefresh()" class="px-4 py-2 rounded-lg bg-white border border-[#0E5A36]/20 text-xs font-bold text-[#0E5A36] cursor-pointer">
-              Actualiser l'écran
-            </button>
+            <div class="w-10 h-10 border-4 border-[#168049] border-t-transparent rounded-full animate-spin mx-auto"></div>
           </div>
         `;
         return;
@@ -1277,10 +1101,7 @@
           <div class="card-cream p-8 max-w-md mx-auto text-center">
             <span class="inline-block px-3 py-1 rounded-full bg-amber-100 text-amber-800 font-bold text-xs uppercase tracking-wider mb-4">Pause</span>
             <h2 class="text-2xl font-black text-[#0E5A36] mb-2">Quiz en pause</h2>
-            <p class="text-sm text-stone-600 font-medium mb-4">L'animateur a suspendu la partie quelques instants.</p>
-            <button id="manual-sync-btn" onclick="manualPlayerRefresh()" class="px-4 py-2 rounded-lg bg-white border border-[#0E5A36]/20 text-xs font-bold text-[#0E5A36] cursor-pointer">
-              Actualiser l'écran
-            </button>
+            <p class="text-sm text-stone-600 font-medium">L'animateur a suspendu la partie quelques instants.</p>
           </div>
         `;
         return;
@@ -1294,10 +1115,7 @@
             <div class="card-cream p-8 max-w-md mx-auto text-center">
               <span class="text-xs font-bold uppercase tracking-wider text-[#168049] block mb-2">Question ${state.currentQuestion + 1} / ${state.totalQuestions}</span>
               <h2 class="text-2xl font-black text-[#0E5A36] mb-3">Réponse enregistrée</h2>
-              <p class="text-sm text-stone-600 font-medium mb-4">Regardez l'écran principal pour le résultat.</p>
-              <button id="manual-sync-btn" onclick="manualPlayerRefresh()" class="px-4 py-2 rounded-lg bg-white border border-[#0E5A36]/20 text-xs font-bold text-[#0E5A36] cursor-pointer">
-                Actualiser l'écran
-              </button>
+              <p class="text-sm text-stone-600 font-medium">Regardez l'écran principal pour le résultat.</p>
             </div>
           `;
           return;
@@ -1332,13 +1150,10 @@
             </div>
             <h2 class="text-3xl font-black text-[#0E5A36] mb-2">${isCorrect ? `+${state.myLastPoints} points` : '0 point'}</h2>
             <p class="text-sm font-bold text-stone-600 mb-4">Total : ${state.myScore} points</p>
-            <div class="bg-white p-4 rounded-xl border border-[#0E5A36]/15 text-xs text-left mb-4">
+            <div class="bg-white p-4 rounded-xl border border-[#0E5A36]/15 text-xs text-left">
               <span class="font-bold text-[#0E5A36] block mb-1">Réponse attendue :</span>
               <span class="font-semibold text-[#1A2E22]">${escapeHtml(q.options[q.correct])}</span>
             </div>
-            <button id="manual-sync-btn" onclick="manualPlayerRefresh()" class="px-4 py-2 rounded-lg bg-white border border-[#0E5A36]/20 text-xs font-bold text-[#0E5A36] cursor-pointer">
-              Actualiser l'écran
-            </button>
           </div>
         `;
         return;
@@ -1353,9 +1168,7 @@
             <div class="text-5xl font-black text-[#0E5A36] my-3">${state.myRank > 0 ? state.myRank + (state.myRank === 1 ? 'er' : 'e') : '-'}</div>
             <p class="text-lg font-extrabold text-[#1A2E22] mb-1">${escapeHtml(state.pseudo)}</p>
             <p class="text-sm font-bold text-[#168049] mb-6">${state.myScore} points</p>
-            ${state.status === 'podium'
-              ? `<button onclick="goHome()" class="btn-primary px-6 py-3 rounded-xl font-bold text-sm">Retour à l'accueil</button>`
-              : `<button id="manual-sync-btn" onclick="manualPlayerRefresh()" class="px-4 py-2 rounded-lg bg-white border border-[#0E5A36]/20 text-xs font-bold text-[#0E5A36] cursor-pointer">Actualiser l'écran</button>`}
+            ${state.status === 'podium' ? `<button onclick="goHome()" class="btn-primary px-6 py-3 rounded-xl font-bold text-sm">Retour à l'accueil</button>` : ''}
           </div>
         `;
       }
@@ -1374,9 +1187,8 @@
     (function init() {
       const urlParams = new URLSearchParams(window.location.search);
       const pinFromUrl = urlParams.get('pin') || '';
-      const tokenFromUrl = urlParams.get('r') || '';
       if (pinFromUrl) {
-        openJoinView(pinFromUrl, true, tokenFromUrl);
+        openJoinView(pinFromUrl, true);
       } else {
         render();
       }
