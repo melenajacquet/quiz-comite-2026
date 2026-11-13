@@ -196,6 +196,8 @@
       pin: '',
       pinLocked: false,
       status: 'lobby',
+      paused: false,
+      remainingTime: 20,
       currentQuestion: 0,
       totalQuestions: 10,
       activeQuestionObj: null,
@@ -254,6 +256,10 @@
       },
       loop() {
         if (!this.isPlaying) return;
+        if (state.paused) {
+          this.timerId = setTimeout(() => this.loop(), 400);
+          return;
+        }
         const lobbyNotes = [261.63, 329.63, 392.00, 523.25, 392.00, 329.63];
         const questionNotes = [293.66, 349.23, 440.00, 587.33, 440.00, 349.23, 329.63, 392.00];
         const notes = this.mode === 'question' ? questionNotes : lobbyNotes;
@@ -296,6 +302,7 @@
       SoundEngine.mode = 'lobby';
       state.view = 'home';
       state.pinLocked = false;
+      state.paused = false;
       render();
     }
 
@@ -434,7 +441,7 @@
       startHostSession();
     }
 
-    // --- RÉSEAU HTTPS ULTRA-LÉGER (ENVOIE UNIQUEMENT LA QUESTION ACTIVE < 400 OCTETS) ---
+    // --- RÉSEAU HTTPS SANS CACHE MOBILE ---
     const NTFY = 'https://ntfy.sh';
 
     async function postSignal(channel, obj) {
@@ -449,9 +456,12 @@
       }
     }
 
-    async function readSignals(channel, since = '15m') {
+    async function readSignals(channel) {
       try {
-        const res = await fetch(`${NTFY}/${channel}/json?poll=1&since=${since}`, { cache: 'no-store' });
+        // Paramètre anti-cache (_t) obligatoire pour Safari / Chrome Mobile
+        const res = await fetch(`${NTFY}/${channel}/json?poll=1&since=all&_t=${Date.now()}`, {
+          cache: 'no-store'
+        });
         if (!res.ok) return [];
         const txt = await res.text();
         if (!txt.trim()) return [];
@@ -469,10 +479,10 @@
       const cmd = {
         seq: state.seq,
         st: state.status,
+        pz: state.paused ? 1 : 0,
         q: state.currentQuestion,
         tot: state.questions.length
       };
-      // On joint uniquement la question active (texte + 4 options + bonne réponse) -> ~300 octets max
       if (qObj && (state.status === 'question' || state.status === 'reveal')) {
         cmd.qd = {
           t: qObj.question,
@@ -499,6 +509,7 @@
       state.pin = pin;
       state.view = 'host';
       state.status = 'lobby';
+      state.paused = false;
       state.currentQuestion = 0;
       state.players = {};
       state.answers = {};
@@ -510,7 +521,7 @@
       const seenIds = new Set();
 
       state.pollInterval = setInterval(async () => {
-        const events = await readSignals(`ce26_in_${pin}`, '15m');
+        const events = await readSignals(`ce26_in_${pin}`);
         events.forEach(ev => {
           if (seenIds.has(ev.id)) return;
           seenIds.add(ev.id);
@@ -529,7 +540,7 @@
               updateLobbyPlayersDOM();
             }
           } else if (msg.t === 'ans') {
-            if (state.status !== 'question' || state.currentQuestion !== msg.q) return;
+            if (state.status !== 'question' || state.paused || state.currentQuestion !== msg.q) return;
             const qKey = 'q_' + msg.q;
             if (!state.answers[qKey]) state.answers[qKey] = {};
             if (state.answers[qKey][msg.id]) return;
@@ -556,7 +567,7 @@
             }
           }
         });
-      }, 1000);
+      }, 900);
     }
 
     function updateLobbyPlayersDOM() {
@@ -570,10 +581,32 @@
         : players.map(p => `<span class="bg-[#0E5A36] text-white font-bold px-4 py-2 rounded-full text-sm shadow-sm">${escapeHtml(p.pseudo)}</span>`).join('');
     }
 
+    function togglePause() {
+      state.paused = !state.paused;
+      broadcastHostCommand();
+      render();
+    }
+
+    function hostBackToLobby() {
+      if (state.timerInterval) clearInterval(state.timerInterval);
+      SoundEngine.mode = 'lobby';
+      state.status = 'lobby';
+      state.paused = false;
+      broadcastHostCommand();
+      render();
+    }
+
     function hostNextQuestion(qIdx) {
+      if (qIdx < 0) {
+        hostBackToLobby();
+        return;
+      }
+      if (state.timerInterval) clearInterval(state.timerInterval);
       SoundEngine.mode = 'question';
       state.status = 'question';
+      state.paused = false;
       state.currentQuestion = qIdx;
+      state.remainingTime = state.questions[qIdx].timer || 20;
       state.questionStartTime = Date.now();
       broadcastHostCommand();
       render();
@@ -584,6 +617,7 @@
       SoundEngine.mode = 'lobby';
       SoundEngine.jingleReveal();
       state.status = 'reveal';
+      state.paused = false;
       broadcastHostCommand();
       render();
     }
@@ -591,6 +625,7 @@
     function hostShowLeaderboard() {
       const isLast = state.currentQuestion >= state.questions.length - 1;
       state.status = isLast ? 'podium' : 'leaderboard';
+      state.paused = false;
       if (isLast) SoundEngine.jingleReveal();
       broadcastHostCommand();
       render();
@@ -604,7 +639,7 @@
         app.innerHTML = `
           <div class="card-cream p-8 md:p-10">
             <div class="flex justify-between items-center mb-6">
-              <button onclick="goHome()" class="text-xs font-bold text-[#168049] hover:underline">← Retour à l'accueil</button>
+              <button onclick="goHome()" class="text-xs font-bold text-[#168049] hover:underline cursor-pointer">← Retour à l'accueil</button>
               <span id="net-status" class="text-xs font-extrabold uppercase tracking-wider text-amber-600">Connexion...</span>
             </div>
 
@@ -660,20 +695,33 @@
       const totalAnswers = Object.keys(answersObj).length;
 
       if (state.status === 'question') {
-        const maxTime = q.timer || 20;
         app.innerHTML = `
-          <div class="card-cream p-6 md:p-10">
-            <div class="flex items-center justify-between mb-6">
-              <span class="px-4 py-1.5 rounded-full bg-[#0E5A36] text-white font-bold text-xs uppercase tracking-wider">
-                Question ${state.currentQuestion + 1} / ${state.questions.length}
-              </span>
-              <div class="flex items-center gap-4">
-                <span id="host-answer-count" class="font-bold text-sm text-[#0E5A36]">${totalAnswers} / ${totalPlayers} réponses</span>
-                <div id="host-timer" class="w-14 h-14 rounded-full bg-[#0E5A36] text-white flex items-center justify-center font-black text-2xl shadow">
-                  ${maxTime}
+          <div class="card-cream p-6 md:p-10 relative">
+            <div class="flex flex-wrap items-center justify-between gap-3 mb-6">
+              <div class="flex items-center gap-2">
+                <button onclick="hostNextQuestion(${state.currentQuestion - 1})" class="px-3.5 py-1.5 rounded-full bg-white hover:bg-stone-100 text-[#0E5A36] border border-[#0E5A36]/20 font-bold text-xs cursor-pointer">
+                  ← ${state.currentQuestion === 0 ? 'Salle d\'attente' : 'Précédente'}
+                </button>
+                <span class="px-4 py-1.5 rounded-full bg-[#0E5A36] text-white font-bold text-xs uppercase tracking-wider">
+                  Question ${state.currentQuestion + 1} / ${state.questions.length}
+                </span>
+              </div>
+              <div class="flex items-center gap-3">
+                <button onclick="togglePause()" class="px-4 py-2 rounded-xl ${state.paused ? 'bg-amber-500 text-white' : 'bg-white text-[#0E5A36] border border-[#0E5A36]/20'} font-extrabold text-xs uppercase tracking-wider cursor-pointer shadow-sm">
+                  ${state.paused ? '▶ Reprendre' : '❚❚ Pause'}
+                </button>
+                <span id="host-answer-count" class="font-bold text-sm text-[#0E5A36]">${totalAnswers} / ${totalPlayers} rép.</span>
+                <div id="host-timer" class="w-14 h-14 rounded-full ${state.paused ? 'bg-amber-500' : 'bg-[#0E5A36]'} text-white flex items-center justify-center font-black text-2xl shadow">
+                  ${state.remainingTime}
                 </div>
               </div>
             </div>
+
+            ${state.paused ? `
+              <div class="bg-amber-50 border-2 border-amber-400 text-amber-900 p-4 rounded-xl text-center font-extrabold text-sm mb-6">
+                Quiz en pause — Le chronomètre et les réponses des participants sont suspendus.
+              </div>
+            ` : ''}
 
             <div class="bg-white p-8 rounded-2xl border border-[#0E5A36]/15 shadow-sm mb-6 text-center">
               <h2 class="text-2xl md:text-3xl font-black text-[#1A2E22] leading-snug">${escapeHtml(q.question)}</h2>
@@ -688,7 +736,8 @@
               `).join('')}
             </div>
 
-            <div class="text-right">
+            <div class="flex items-center justify-between">
+              <button onclick="goHome()" class="text-xs font-bold text-stone-500 hover:underline cursor-pointer">Quitter la session</button>
               <button onclick="hostRevealAnswer()" class="px-5 py-2.5 rounded-xl bg-stone-800 hover:bg-black text-white font-bold text-xs uppercase tracking-wider cursor-pointer">
                 Passer à la réponse
               </button>
@@ -697,22 +746,24 @@
         `;
 
         if (state.timerInterval) clearInterval(state.timerInterval);
-        let remaining = maxTime;
-        state.timerInterval = setInterval(() => {
-          remaining--;
-          const el = document.getElementById('host-timer');
-          if (el) {
-            el.textContent = Math.max(0, remaining);
-            if (remaining <= 5) {
-              el.classList.add('timer-urgent');
-              SoundEngine.mode = 'urgent';
+        if (!state.paused) {
+          state.timerInterval = setInterval(() => {
+            if (state.paused) return;
+            state.remainingTime--;
+            const el = document.getElementById('host-timer');
+            if (el) {
+              el.textContent = Math.max(0, state.remainingTime);
+              if (state.remainingTime <= 5) {
+                el.classList.add('timer-urgent');
+                SoundEngine.mode = 'urgent';
+              }
             }
-          }
-          if (remaining <= 0) {
-            clearInterval(state.timerInterval);
-            hostRevealAnswer();
-          }
-        }, 1000);
+            if (state.remainingTime <= 0) {
+              clearInterval(state.timerInterval);
+              hostRevealAnswer();
+            }
+          }, 1000);
+        }
         return;
       }
 
@@ -726,10 +777,15 @@
 
         app.innerHTML = `
           <div class="card-cream p-6 md:p-10">
-            <div class="flex items-center justify-between mb-6">
-              <span class="px-4 py-1.5 rounded-full bg-[#0E5A36] text-white font-bold text-xs uppercase tracking-wider">
-                Résultat — Question ${state.currentQuestion + 1} / ${state.questions.length}
-              </span>
+            <div class="flex flex-wrap items-center justify-between gap-3 mb-6">
+              <div class="flex items-center gap-2">
+                <button onclick="hostNextQuestion(${state.currentQuestion})" class="px-3.5 py-1.5 rounded-full bg-white hover:bg-stone-100 text-[#0E5A36] border border-[#0E5A36]/20 font-bold text-xs cursor-pointer">
+                  ← Revoir la question
+                </button>
+                <span class="px-4 py-1.5 rounded-full bg-[#0E5A36] text-white font-bold text-xs uppercase tracking-wider">
+                  Résultat — Question ${state.currentQuestion + 1} / ${state.questions.length}
+                </span>
+              </div>
               <button onclick="hostShowLeaderboard()" class="btn-primary px-6 py-3 rounded-xl font-extrabold text-sm shadow cursor-pointer">
                 ${state.currentQuestion >= state.questions.length - 1 ? 'Voir le podium final' : 'Classement intermédiaire'}
               </button>
@@ -769,7 +825,7 @@
           <div class="card-cream p-6 md:p-10 max-w-3xl mx-auto">
             <div class="flex flex-wrap items-center justify-between gap-4 mb-8">
               <div>
-                <span class="text-xs font-bold uppercase tracking-wider text-[#168049] block mb-1">Quiz Comité Echange 2026</span>
+                <button onclick="hostRevealAnswer()" class="text-xs font-bold text-[#168049] hover:underline mb-1 block cursor-pointer">← Retour à la réponse</button>
                 <h2 class="text-3xl font-black text-[#0E5A36]">${isPodium ? 'Podium Final' : 'Classement en direct'}</h2>
               </div>
               <div class="flex gap-2">
@@ -778,7 +834,7 @@
                   <button onclick="goHome()" class="btn-primary px-6 py-3 rounded-xl font-extrabold text-sm cursor-pointer">Terminer</button>
                 ` : `
                   <button onclick="hostNextQuestion(${state.currentQuestion + 1})" class="btn-primary px-6 py-3 rounded-xl font-extrabold text-sm shadow cursor-pointer">
-                    Question suivante
+                    Question suivante (${state.currentQuestion + 2} / ${state.questions.length})
                   </button>
                 `}
               </div>
@@ -883,6 +939,7 @@
       state.pin = pin;
       state.pseudo = pseudo;
       state.status = 'lobby';
+      state.paused = false;
       state.currentQuestion = 0;
       state.totalQuestions = state.questions.length;
       state.activeQuestionObj = null;
@@ -902,38 +959,53 @@
       state.view = 'player';
       render();
 
-      state.pollInterval = setInterval(async () => {
-        const events = await readSignals(`ce26_out_${pin}`, '15m');
+      const syncPlayer = async () => {
+        const events = await readSignals(`ce26_out_${pin}`);
         if (events.length === 0) return;
 
-        const latestEv = events[events.length - 1];
-        let cmd = null;
-        try { cmd = JSON.parse(latestEv.message); } catch (err) { return; }
-        if (!cmd || typeof cmd.seq !== 'number') return;
+        // Parcourt les événements pour trouver celui avec le numéro de séquence le plus élevé
+        let latestCmd = null;
+        events.forEach(ev => {
+          try {
+            const parsed = JSON.parse(ev.message);
+            if (parsed && typeof parsed.seq === 'number') {
+              if (!latestCmd || parsed.seq > latestCmd.seq) {
+                latestCmd = parsed;
+              }
+            }
+          } catch (err) {}
+        });
 
-        if (cmd.seq > state.seq) {
+        if (!latestCmd) return;
+
+        if (latestCmd.seq > state.seq) {
           const prevQ = state.currentQuestion;
-          state.seq = cmd.seq;
-          state.status = cmd.st;
-          state.currentQuestion = cmd.q;
-          if (cmd.tot) state.totalQuestions = cmd.tot;
+          const prevStatus = state.status;
+          state.seq = latestCmd.seq;
+          state.status = latestCmd.st;
+          state.paused = latestCmd.pz === 1;
+          state.currentQuestion = latestCmd.q;
+          if (latestCmd.tot) state.totalQuestions = latestCmd.tot;
 
-          if (cmd.qd) {
+          if (latestCmd.qd) {
             state.activeQuestionObj = {
-              question: cmd.qd.t,
-              options: cmd.qd.o,
-              correct: cmd.qd.c,
-              timer: cmd.qd.tm || 20
+              question: latestCmd.qd.t,
+              options: latestCmd.qd.o,
+              correct: latestCmd.qd.c,
+              timer: latestCmd.qd.tm || 20
             };
           }
 
-          if (cmd.st === 'question' && prevQ !== cmd.q) {
-            state.selectedAnswer = null;
-            state.questionStartTime = Date.now();
+          // Réinitialise la réponse dès qu'on passe à une nouvelle question ou qu'on relance une question
+          if (latestCmd.st === 'question' && (prevQ !== latestCmd.q || prevStatus !== 'question')) {
+            if (!state.paused) {
+              state.selectedAnswer = null;
+              state.questionStartTime = Date.now();
+            }
           }
 
-          if (cmd.st === 'reveal') {
-            const qObj = state.activeQuestionObj || state.questions[cmd.q];
+          if (latestCmd.st === 'reveal' && prevStatus !== 'reveal') {
+            const qObj = state.activeQuestionObj || state.questions[latestCmd.q];
             if (qObj && state.selectedAnswer === qObj.correct) {
               const elapsed = Math.max(0, (Date.now() - state.questionStartTime) / 1000);
               const maxTime = qObj.timer || 20;
@@ -945,21 +1017,24 @@
             }
           }
 
-          if (Array.isArray(cmd.rk)) {
-            const idx = cmd.rk.findIndex(item => item[0] === state.playerId);
+          if (Array.isArray(latestCmd.rk)) {
+            const idx = latestCmd.rk.findIndex(item => item[0] === state.playerId);
             if (idx !== -1) {
               state.myRank = idx + 1;
-              state.myScore = cmd.rk[idx][1];
+              state.myScore = latestCmd.rk[idx][1];
             }
           }
 
           render();
         }
-      }, 900);
+      };
+
+      await syncPlayer();
+      state.pollInterval = setInterval(syncPlayer, 900);
     }
 
     async function handlePlayerAnswer(answerIdx) {
-      if (state.selectedAnswer !== null) return;
+      if (state.selectedAnswer !== null || state.paused) return;
       state.selectedAnswer = answerIdx;
       render();
 
@@ -979,6 +1054,17 @@
             <h2 class="text-2xl font-black text-[#0E5A36] mb-2">Bienvenue, ${escapeHtml(state.pseudo)}</h2>
             <p class="text-sm text-stone-600 font-medium mb-6">Votre nom apparaît à l'écran. La partie va bientôt commencer.</p>
             <div class="w-10 h-10 border-4 border-[#168049] border-t-transparent rounded-full animate-spin mx-auto"></div>
+          </div>
+        `;
+        return;
+      }
+
+      if (state.paused) {
+        app.innerHTML = `
+          <div class="card-cream p-8 max-w-md mx-auto text-center">
+            <span class="inline-block px-3 py-1 rounded-full bg-amber-100 text-amber-800 font-bold text-xs uppercase tracking-wider mb-4">Pause</span>
+            <h2 class="text-2xl font-black text-[#0E5A36] mb-2">Quiz en pause</h2>
+            <p class="text-sm text-stone-600 font-medium">L'animateur a suspendu la partie quelques instants.</p>
           </div>
         `;
         return;
