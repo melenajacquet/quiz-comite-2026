@@ -60,7 +60,6 @@
   </div>
 
   <script>
-    // Stockage sécurisé (résistant au mode navigation privée)
     const SafeStorage = {
       mem: {},
       get(k) {
@@ -69,10 +68,6 @@
       set(k, v) {
         this.mem[k] = v;
         try { window.localStorage.setItem(k, v); } catch (e) {}
-      },
-      remove(k) {
-        delete this.mem[k];
-        try { window.localStorage.removeItem(k); } catch (e) {}
       }
     };
 
@@ -198,7 +193,8 @@
     let state = {
       view: 'home',
       questions: savedQuestions || JSON.parse(JSON.stringify(DEFAULT_QUESTIONS)),
-      gistId: '',
+      pin: '',
+      binId: '',
       pinLocked: false,
       status: 'lobby',
       paused: false,
@@ -209,7 +205,7 @@
       questionStartTime: 0,
       players: {},
       answers: {},
-      playerId: SafeStorage.get('quiz_ce_2026_pid') || ('p_' + Math.random().toString(36).substring(2, 10)),
+      playerId: SafeStorage.get('quiz_ce_2026_pid') || ('p_' + Math.random().toString(36).substring(2, 9)),
       pseudo: SafeStorage.get('quiz_ce_2026_pseudo') || '',
       selectedAnswer: null,
       myScore: 0,
@@ -343,7 +339,7 @@
             <button onclick="openJoinView()" class="bg-[#0E5A36] hover:bg-[#093E25] text-white p-6 rounded-2xl shadow-md flex flex-col justify-between transition cursor-pointer">
               <span class="text-xs uppercase tracking-wider opacity-80 font-bold mb-2">Participant</span>
               <span class="text-xl font-extrabold mb-1">Rejoindre la partie</span>
-              <span class="text-xs opacity-90">Entrer l'identifiant de salle sur téléphone</span>
+              <span class="text-xs opacity-90">Entrer le code PIN sur téléphone</span>
             </button>
 
             <button onclick="openEditor()" class="bg-white hover:bg-stone-100 text-[#0E5A36] border-2 border-[#0E5A36]/20 p-6 rounded-2xl shadow-sm flex flex-col justify-between transition cursor-pointer">
@@ -446,118 +442,28 @@
       startHostSession();
     }
 
-    // --- TRANSPORT 100 % HTTPS VIA GITHUB API (AUTORISÉ PAR PROXY/VPN D'ENTREPRISE) ---
-    function getGitHubToken(askIfMissing = false) {
-      let stored = SafeStorage.get('quiz_ce_2026_gh_token');
-      if (!stored && askIfMissing) {
-        stored = prompt("Collez votre jeton GitHub (ghp_... avec permission 'gist') pour ouvrir la salle sur ce PC :");
-        if (stored && stored.trim()) {
-          SafeStorage.set('quiz_ce_2026_gh_token', stored.trim());
-        }
-      }
-      return stored ? stored.trim() : '';
+    // --- BACKEND SIMPLE SANS CONFIGURATION (BASE FIREBASE REST HTTPS) ---
+    // Chaque session a son propre dossier unique : /ce26_sessions/{pin}
+    // L'animateur écrit uniquement dans /ce26_sessions/{pin}/host
+    // Chaque joueur écrit uniquement dans /ce26_sessions/{pin}/players/{playerId} et /answers/{q}/{playerId}
+    const DB_ROOT = "https://quiz-comite-default-rtdb.europe-west1.firebasedatabase.app";
+
+    async function dbPut(path, data) {
+      const res = await fetch(`${DB_ROOT}/${path}.json`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(data)
+      });
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      return true;
     }
 
-    function resetGitHubToken() {
-      SafeStorage.remove('quiz_ce_2026_gh_token');
-      alert("Jeton réinitialisé. Cliquez sur « Lancer une session » pour en saisir un nouveau.");
-      goHome();
-    }
-
-    async function createRoomGist(initialPayload) {
-      const token = getGitHubToken(true);
-      if (!token) throw new Error("Jeton manquant");
-      const res = await fetch("https://api.github.com/gists", {
-        method: "POST",
-        headers: {
-          "Authorization": `token ${token}`,
-          "Accept": "application/vnd.github+json",
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          description: "Quiz Comite Echange 2026 - Session Live",
-          public: false,
-          files: {
-            "state.json": { content: JSON.stringify(initialPayload) }
-          }
-        })
+    async function dbGet(path) {
+      const res = await fetch(`${DB_ROOT}/${path}.json?_t=${Date.now()}`, {
+        cache: "no-store"
       });
-      if (res.status === 401 || res.status === 403) {
-        SafeStorage.remove('quiz_ce_2026_gh_token');
-        throw new Error("Jeton GitHub invalide ou expiré (401/403)");
-      }
-      if (!res.ok) throw new Error("Erreur GitHub API : " + res.status);
-      const data = await res.json();
-      return data.id;
-    }
-
-    async function updateRoomGist(gistId, payload) {
-      const token = getGitHubToken(false);
-      if (!token) return false;
-      const res = await fetch(`https://api.github.com/gists/${gistId}`, {
-        method: "PATCH",
-        headers: {
-          "Authorization": `token ${token}`,
-          "Accept": "application/vnd.github+json",
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          files: {
-            "state.json": { content: JSON.stringify(payload) }
-          }
-        })
-      });
-      return res.ok;
-    }
-
-    async function postPlayerComment(gistId, msgObj) {
-      const token = getGitHubToken(false);
-      const headers = {
-        "Accept": "application/vnd.github+json",
-        "Content-Type": "application/json"
-      };
-      if (token) headers["Authorization"] = `token ${token}`;
-      const res = await fetch(`https://api.github.com/gists/${gistId}/comments`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({ body: JSON.stringify(msgObj) })
-      });
-      return res.ok;
-    }
-
-    async function readRoomState(gistId) {
-      const token = getGitHubToken(false);
-      const headers = { "Accept": "application/vnd.github+json" };
-      if (token) headers["Authorization"] = `token ${token}`;
-      const res = await fetch(`https://api.github.com/gists/${gistId}?_t=${Date.now()}`, {
-        cache: "no-store",
-        headers
-      });
-      if (!res.ok) return null;
-      const data = await res.json();
-      if (data && data.files && data.files["state.json"]) {
-        return JSON.parse(data.files["state.json"].content);
-      }
-      return null;
-    }
-
-    async function readPlayerComments(gistId) {
-      const token = getGitHubToken(false);
-      const headers = { "Accept": "application/vnd.github+json" };
-      if (token) headers["Authorization"] = `token ${token}`;
-      const res = await fetch(`https://api.github.com/gists/${gistId}/comments?per_page=100&_t=${Date.now()}`, {
-        cache: "no-store",
-        headers
-      });
-      if (!res.ok) return [];
-      const list = await res.json();
-      const msgs = [];
-      list.forEach(c => {
-        try {
-          if (c && c.body) msgs.push(JSON.parse(c.body));
-        } catch (e) {}
-      });
-      return msgs;
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      return await res.json();
     }
 
     function buildHostPayload() {
@@ -568,8 +474,7 @@
         st: state.status,
         pz: state.paused ? 1 : 0,
         q: state.currentQuestion,
-        tot: state.questions.length,
-        tk: getGitHubToken(false)
+        tot: state.questions.length
       };
       if (qObj && (state.status === 'question' || state.status === 'reveal')) {
         payload.qd = {
@@ -587,20 +492,27 @@
     }
 
     async function broadcastHostCommand() {
-      if (!state.gistId) return;
-      const payload = buildHostPayload();
+      if (!state.pin) return;
       try {
-        const ok = await updateRoomGist(state.gistId, payload);
+        await dbPut(`ce26_sessions/${state.pin}/host`, buildHostPayload());
         const statusEl = document.getElementById('net-status');
         if (statusEl) {
-          statusEl.textContent = ok ? 'Salle en ligne (GitHub)' : 'Synchronisation...';
-          statusEl.className = `text-xs font-extrabold uppercase tracking-wider ${ok ? 'text-[#168049]' : 'text-amber-600'}`;
+          statusEl.textContent = 'Salle en ligne';
+          statusEl.className = 'text-xs font-extrabold uppercase tracking-wider text-[#168049]';
         }
-      } catch (e) {}
+      } catch (e) {
+        const statusEl = document.getElementById('net-status');
+        if (statusEl) {
+          statusEl.textContent = 'Reconnexion...';
+          statusEl.className = 'text-xs font-extrabold uppercase tracking-wider text-amber-600';
+        }
+      }
     }
 
     async function startHostSession() {
       cleanupNetwork();
+      const pin = Math.floor(100000 + Math.random() * 900000).toString();
+      state.pin = pin;
       state.view = 'host';
       state.status = 'lobby';
       state.paused = false;
@@ -608,72 +520,77 @@
       state.players = {};
       state.answers = {};
       state.seq = 0;
-      state.gistId = '';
       SoundEngine.mode = 'lobby';
       render();
 
       try {
-        const gid = await createRoomGist(buildHostPayload());
-        state.gistId = gid;
-        render();
+        await dbPut(`ce26_sessions/${pin}`, {
+          host: buildHostPayload(),
+          players: {},
+          answers: {}
+        });
         const statusEl = document.getElementById('net-status');
         if (statusEl) {
-          statusEl.textContent = 'Salle en ligne (GitHub)';
+          statusEl.textContent = 'Salle en ligne';
           statusEl.className = 'text-xs font-extrabold uppercase tracking-wider text-[#168049]';
         }
       } catch (e) {
         const statusEl = document.getElementById('net-status');
         if (statusEl) {
-          statusEl.textContent = e.message || 'Erreur réseau / jeton';
+          statusEl.textContent = 'Erreur réseau (' + e.message + ')';
           statusEl.className = 'text-xs font-extrabold uppercase tracking-wider text-red-600';
         }
         return;
       }
 
       state.pollInterval = setInterval(async () => {
-        if (!state.gistId) return;
         try {
-          const msgs = await readPlayerComments(state.gistId);
-          let lobbyChanged = false;
-          msgs.forEach(msg => {
-            if (!msg || !msg.id) return;
-            if (msg.t === 'join') {
-              if (!state.players[msg.id]) {
-                state.players[msg.id] = { id: msg.id, pseudo: msg.n || 'Joueur', score: 0, lastPoints: 0 };
+          const sessionData = await dbGet(`ce26_sessions/${pin}`);
+          if (!sessionData) return;
+
+          if (sessionData.players) {
+            let lobbyChanged = false;
+            Object.entries(sessionData.players).forEach(([pid, pInfo]) => {
+              if (!pInfo || !pInfo.pseudo) return;
+              if (!state.players[pid]) {
+                state.players[pid] = { id: pid, pseudo: pInfo.pseudo, score: 0, lastPoints: 0 };
                 lobbyChanged = true;
-              } else if (state.players[msg.id].pseudo !== msg.n && msg.n) {
-                state.players[msg.id].pseudo = msg.n;
+              } else if (state.players[pid].pseudo !== pInfo.pseudo) {
+                state.players[pid].pseudo = pInfo.pseudo;
                 lobbyChanged = true;
               }
-            } else if (msg.t === 'ans') {
-              if (state.status !== 'question' || state.paused || state.currentQuestion !== msg.q) return;
-              const qKey = 'q_' + msg.q;
-              if (!state.answers[qKey]) state.answers[qKey] = {};
-              if (state.answers[qKey][msg.id]) return;
-
-              const qObj = state.questions[msg.q];
-              const elapsed = Math.max(0, (Date.now() - state.questionStartTime) / 1000);
-              const maxTime = qObj.timer || 20;
-              const isCorrect = (msg.a === qObj.correct);
-              const points = isCorrect ? Math.round(500 + 500 * Math.max(0, Math.min(1, 1 - (elapsed / maxTime)))) : 0;
-
-              state.answers[qKey][msg.id] = { answerIndex: msg.a, isCorrect, points };
-              if (!state.players[msg.id]) {
-                state.players[msg.id] = { id: msg.id, pseudo: msg.n || 'Joueur', score: 0, lastPoints: 0 };
-              }
-              state.players[msg.id].score += points;
-              state.players[msg.id].lastPoints = points;
+            });
+            if (lobbyChanged && state.status === 'lobby') {
+              updateLobbyPlayersDOM();
             }
-          });
-
-          if (lobbyChanged && state.status === 'lobby') {
-            updateLobbyPlayersDOM();
           }
 
-          if (state.status === 'question') {
+          if (state.status === 'question' && !state.paused && sessionData.answers) {
             const qKey = 'q_' + state.currentQuestion;
+            const remoteAns = sessionData.answers[qKey] || {};
+            if (!state.answers[qKey]) state.answers[qKey] = {};
+
+            const qObj = state.questions[state.currentQuestion];
+            const maxTime = qObj.timer || 20;
+
+            Object.entries(remoteAns).forEach(([pid, ansObj]) => {
+              if (!ansObj || typeof ansObj.a !== 'number') return;
+              if (state.answers[qKey][pid]) return;
+
+              const elapsed = Math.max(0, (Date.now() - state.questionStartTime) / 1000);
+              const isCorrect = (ansObj.a === qObj.correct);
+              const points = isCorrect ? Math.round(500 + 500 * Math.max(0, Math.min(1, 1 - (elapsed / maxTime)))) : 0;
+
+              state.answers[qKey][pid] = { answerIndex: ansObj.a, isCorrect, points };
+              if (!state.players[pid]) {
+                state.players[pid] = { id: pid, pseudo: ansObj.n || 'Joueur', score: 0, lastPoints: 0 };
+              }
+              state.players[pid].score += points;
+              state.players[pid].lastPoints = points;
+            });
+
             const totalPlayers = Object.keys(state.players).length;
-            const totalAnswers = Object.keys(state.answers[qKey] || {}).length;
+            const totalAnswers = Object.keys(state.answers[qKey]).length;
             const ansEl = document.getElementById('host-answer-count');
             if (ansEl) ansEl.textContent = `${totalAnswers} / ${totalPlayers} rép.`;
 
@@ -682,7 +599,7 @@
             }
           }
         } catch (e) {}
-      }, 1200);
+      }, 1000);
     }
 
     function updateLobbyPlayersDOM() {
@@ -750,32 +667,25 @@
       if (state.status === 'lobby') {
         const players = Object.values(state.players);
         const baseUrl = window.location.origin + window.location.pathname;
-        const joinUrl = state.gistId ? `${baseUrl}?room=${state.gistId}` : '';
+        const joinUrl = `${baseUrl}?pin=${state.pin}`;
 
         app.innerHTML = `
           <div class="card-cream p-8 md:p-10">
-            <div class="flex flex-wrap justify-between items-center gap-2 mb-6">
-              <div class="flex items-center gap-4">
-                <button onclick="goHome()" class="text-xs font-bold text-[#168049] hover:underline cursor-pointer">← Retour à l'accueil</button>
-                <button onclick="resetGitHubToken()" class="text-xs font-semibold text-stone-400 hover:text-stone-600 underline cursor-pointer">Changer de jeton</button>
-              </div>
-              <span id="net-status" class="text-xs font-extrabold uppercase tracking-wider ${state.gistId ? 'text-[#168049]' : 'text-amber-600'}">
-                ${state.gistId ? 'Salle en ligne (GitHub)' : 'Création de la salle...'}
-              </span>
+            <div class="flex justify-between items-center mb-6">
+              <button onclick="goHome()" class="text-xs font-bold text-[#168049] hover:underline cursor-pointer">← Retour à l'accueil</button>
+              <span id="net-status" class="text-xs font-extrabold uppercase tracking-wider text-amber-600">Création de la salle...</span>
             </div>
 
             <div class="grid grid-cols-1 md:grid-cols-12 gap-8 items-center bg-white p-6 md:p-8 rounded-2xl border border-[#0E5A36]/15 shadow-sm mb-8">
               <div class="md:col-span-4 flex flex-col items-center justify-center border-b md:border-b-0 md:border-r border-stone-200 pb-6 md:pb-0 md:pr-6">
-                <div id="qrcode-box" class="p-3 bg-white rounded-xl border-2 border-[#0E5A36]/20 shadow-sm mb-3 min-w-[190px] min-h-[190px] flex items-center justify-center">
-                  ${state.gistId ? '' : '<span class="text-xs text-stone-400">Génération...</span>'}
-                </div>
+                <div id="qrcode-box" class="p-3 bg-white rounded-xl border-2 border-[#0E5A36]/20 shadow-sm mb-3"></div>
                 <span class="text-xs font-bold text-[#0E5A36] text-center">Scannez pour entrer directement</span>
               </div>
               <div class="md:col-span-8 text-center md:text-left">
-                <p class="text-xs font-bold uppercase tracking-wider text-[#168049] mb-1">Identifiant de la session</p>
-                <div class="text-base md:text-lg font-black text-[#0E5A36] break-all my-2 select-all bg-[#F4F3EE] px-3 py-2 rounded-lg">${state.gistId || '...'}</div>
+                <p class="text-xs font-bold uppercase tracking-wider text-[#168049] mb-1">Code de la session</p>
+                <div class="text-5xl md:text-7xl font-black text-[#0E5A36] tracking-widest my-2 select-all">${state.pin}</div>
                 <p class="text-xs text-stone-500 break-all mb-6">${escapeHtml(joinUrl)}</p>
-                <button onclick="hostNextQuestion(0)" ${state.gistId ? '' : 'disabled'} class="btn-primary px-8 py-4 rounded-xl font-extrabold text-lg shadow-lg cursor-pointer disabled:opacity-50">
+                <button onclick="hostNextQuestion(0)" class="btn-primary px-8 py-4 rounded-xl font-extrabold text-lg shadow-lg cursor-pointer">
                   Démarrer le quiz (${state.questions.length} questions)
                 </button>
               </div>
@@ -794,22 +704,20 @@
             </div>
           </div>
         `;
-        if (state.gistId) {
-          setTimeout(() => {
-            const qrBox = document.getElementById('qrcode-box');
-            if (qrBox) {
-              qrBox.innerHTML = '';
-              new QRCode(qrBox, {
-                text: joinUrl,
-                width: 190,
-                height: 190,
-                colorDark: "#0E5A36",
-                colorLight: "#FFFFFF",
-                correctLevel: QRCode.CorrectLevel.L
-              });
-            }
-          }, 30);
-        }
+        setTimeout(() => {
+          const qrBox = document.getElementById('qrcode-box');
+          if (qrBox) {
+            qrBox.innerHTML = '';
+            new QRCode(qrBox, {
+              text: joinUrl,
+              width: 190,
+              height: 190,
+              colorDark: "#0E5A36",
+              colorLight: "#FFFFFF",
+              correctLevel: QRCode.CorrectLevel.M
+            });
+          }
+        }, 30);
         return;
       }
 
@@ -1001,11 +909,11 @@
     }
 
     // --- JOUEUR (TÉLÉPHONE) ---
-    function openJoinView(prefillRoom = '', locked = false) {
+    function openJoinView(prefillPin = '', locked = false) {
       cleanupNetwork();
       state.view = 'join';
-      if (prefillRoom) {
-        state.gistId = prefillRoom;
+      if (prefillPin) {
+        state.pin = prefillPin;
         state.pinLocked = locked;
       }
       render();
@@ -1023,20 +931,20 @@
           <span class="text-xs font-bold uppercase tracking-wider text-[#168049] block mb-1">Quiz Comité Echange 2026</span>
           <h2 class="text-2xl font-black text-[#0E5A36] mb-1">Rejoindre la partie</h2>
           <p class="text-xs text-stone-600 font-medium mb-6">
-            ${state.pinLocked ? 'Indiquez simplement votre prénom ou magasin pour entrer.' : 'Collez l\'identifiant de session et indiquez votre prénom.'}
+            ${state.pinLocked ? 'Indiquez simplement votre prénom ou magasin pour entrer.' : 'Entrez le code affiché à l\'écran et votre prénom ou magasin.'}
           </p>
 
           <form onsubmit="handleJoinSubmit(event)" class="space-y-4">
             ${state.pinLocked ? `
-              <input type="hidden" id="join-pin" value="${escapeHtml(state.gistId)}">
+              <input type="hidden" id="join-pin" value="${escapeHtml(state.pin)}">
               <div class="flex items-center justify-between bg-white px-4 py-2.5 rounded-xl border border-[#0E5A36]/15 text-xs">
-                <span class="font-bold text-[#0E5A36]">Salle détectée via QR code</span>
+                <span class="font-bold text-[#0E5A36]">Session : <strong>${escapeHtml(state.pin)}</strong></span>
                 <button type="button" onclick="unlockPinField()" class="text-[#168049] underline font-bold">Changer</button>
               </div>
             ` : `
               <div>
-                <label class="block text-xs font-bold uppercase tracking-wider text-[#0E5A36] mb-1">Identifiant de salle</label>
-                <input type="text" id="join-pin" required value="${escapeHtml(state.gistId)}" placeholder="Identifiant affiché sur l'écran" class="w-full bg-white border-2 border-[#0E5A36]/20 rounded-xl px-4 py-3 text-center text-sm font-black text-[#0E5A36] focus:outline-none focus:border-[#168049]">
+                <label class="block text-xs font-bold uppercase tracking-wider text-[#0E5A36] mb-1">Code PIN</label>
+                <input type="text" id="join-pin" inputmode="numeric" maxlength="6" required value="${escapeHtml(state.pin)}" placeholder="000000" class="w-full bg-white border-2 border-[#0E5A36]/20 rounded-xl px-4 py-3 text-center text-2xl font-black tracking-widest text-[#0E5A36] focus:outline-none focus:border-[#168049]">
               </div>
             `}
             <div>
@@ -1053,29 +961,25 @@
 
     async function handleJoinSubmit(e) {
       e.preventDefault();
-      const gid = document.getElementById('join-pin').value.trim();
+      const pin = document.getElementById('join-pin').value.trim();
       const pseudo = document.getElementById('join-pseudo').value.trim();
       const btn = document.getElementById('join-btn');
-      if (!gid || !pseudo) return;
+      if (!pin || !pseudo) return;
 
       btn.disabled = true;
       btn.textContent = "Connexion...";
 
       try {
-        const roomState = await readRoomState(gid);
-        if (!roomState) {
-          alert("Salle introuvable. Scannez à nouveau le QR code affiché à l'écran.");
+        const hostState = await dbGet(`ce26_sessions/${pin}/host`);
+        if (!hostState) {
+          alert("Code PIN introuvable (" + pin + "). Vérifiez le code affiché sur l'écran principal.");
           btn.disabled = false;
           btn.textContent = "Entrer dans la partie";
           return;
         }
 
-        if (roomState.tk) {
-          SafeStorage.set('quiz_ce_2026_gh_token', roomState.tk);
-        }
-
         cleanupNetwork();
-        state.gistId = gid;
+        state.pin = pin;
         state.pseudo = pseudo;
         state.status = 'lobby';
         state.paused = false;
@@ -1089,10 +993,9 @@
         state.seq = 0;
         SafeStorage.set('quiz_ce_2026_pseudo', pseudo);
 
-        await postPlayerComment(gid, {
-          t: 'join',
-          id: state.playerId,
-          n: pseudo
+        await dbPut(`ce26_sessions/${pin}/players/${state.playerId}`, {
+          pseudo: pseudo,
+          joinedAt: Date.now()
         });
 
         state.view = 'player';
@@ -1100,7 +1003,7 @@
 
         const syncState = async () => {
           try {
-            const latestCmd = await readRoomState(gid);
+            const latestCmd = await dbGet(`ce26_sessions/${pin}/host`);
             if (!latestCmd || typeof latestCmd.seq !== 'number') return;
 
             if (latestCmd.seq > state.seq) {
@@ -1155,7 +1058,7 @@
         };
 
         await syncState();
-        state.pollInterval = setInterval(syncState, 1100);
+        state.pollInterval = setInterval(syncState, 900);
       } catch (err) {
         alert("Erreur de connexion réseau.");
         btn.disabled = false;
@@ -1169,12 +1072,10 @@
       render();
 
       try {
-        await postPlayerComment(state.gistId, {
-          t: 'ans',
-          id: state.playerId,
+        await dbPut(`ce26_sessions/${state.pin}/answers/q_${state.currentQuestion}/${state.playerId}`, {
+          a: answerIdx,
           n: state.pseudo,
-          q: state.currentQuestion,
-          a: answerIdx
+          ts: Date.now()
         });
       } catch (e) {}
     }
@@ -1183,7 +1084,7 @@
       if (state.status === 'lobby') {
         app.innerHTML = `
           <div class="card-cream p-8 max-w-md mx-auto text-center">
-            <span class="inline-block px-3 py-1 rounded-full bg-[#0E5A36]/10 text-[#0E5A36] font-bold text-xs mb-4">Connecté à la salle</span>
+            <span class="inline-block px-3 py-1 rounded-full bg-[#0E5A36]/10 text-[#0E5A36] font-bold text-xs mb-4">Connecté (Session ${escapeHtml(state.pin)})</span>
             <h2 class="text-2xl font-black text-[#0E5A36] mb-2">Bienvenue, ${escapeHtml(state.pseudo)}</h2>
             <p class="text-sm text-stone-600 font-medium mb-6">Votre nom apparaît à l'écran. La partie va bientôt commencer.</p>
             <div class="w-10 h-10 border-4 border-[#168049] border-t-transparent rounded-full animate-spin mx-auto"></div>
@@ -1282,9 +1183,9 @@
 
     (function init() {
       const urlParams = new URLSearchParams(window.location.search);
-      const roomFromUrl = urlParams.get('room') || '';
-      if (roomFromUrl) {
-        openJoinView(roomFromUrl, true);
+      const pinFromUrl = urlParams.get('pin') || '';
+      if (pinFromUrl) {
+        openJoinView(pinFromUrl, true);
       } else {
         render();
       }
